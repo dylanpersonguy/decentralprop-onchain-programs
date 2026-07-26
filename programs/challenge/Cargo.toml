@@ -1,0 +1,37 @@
+[package]
+name = "challenge"
+version = "0.1.0"
+description = "DecentralProp challenge_program — challenge lifecycle + immutable rule snapshot"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "challenge"
+
+[features]
+default = []
+# TEST-ONLY: shorten the fraud-proof window to 30s so localnet `anchor test` + devnet test builds can
+# exercise finalize_settlement. Never enabled for a mainnet build. See SETTLEMENT_CHALLENGE_WINDOW.
+test-fast = []
+# DEVNET-ONLY: 5-minute fraud window. `test-fast`'s 30s is tuned for automated harnesses that warp or
+# sleep; 5 minutes is for a HUMAN driving the real deployed site — long enough to watch a withdrawal
+# sit Provisional and to see the keeper defer, short enough to finish the loop in a sitting. Wins over
+# `test-fast` if both are somehow set. NEVER enable for a mainnet build.
+devnet-fast = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "batch/idl-build"]
+# Exposes `settlement::fuzz_support` (Merkle builder + soundness invariant checker) to the cargo-fuzz
+# target. Never enabled in the deployed program build.
+fuzzing = []
+
+[lints]
+workspace = true
+
+[dependencies]
+anchor-lang = "0.31.1"
+solana-security-txt = "1.1.3"
+# H-2: read committed trade roots to adjudicate input-authenticity faults. Acyclic (batch imports nothing).
+batch = { path = "../batch", features = ["cpi"] }

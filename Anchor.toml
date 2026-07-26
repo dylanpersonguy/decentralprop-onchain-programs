@@ -1,0 +1,32 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolver = true
+skip-lint = false
+
+[programs.localnet]
+batch = "29NK1pYubMLCRDi17YUGF3iMoFYyeYhxoSi6PakKdFLx"
+firm = "4ZmeSsuMU38jnc42P53gjY8d1N6WPc3LUibiboKwMaEj"
+challenge = "ENyhfPtpY1BPDFfdMmrUa4XJxuqXSeejgtGBHhhJsEBR"
+dispute = "3BTD73nYinwAf3pWR1Fw5H9avyq7dYopVARkmYi9245H"
+bonding_curve = "DeabUFkCGWWG9CHyDAeYMj9anLmguFacvBnMidpkkxBU"
+
+# Program ids are the program-keypair pubkeys (target/deploy/*-keypair.json), so they are
+# identical across clusters. Deploy with `anchor deploy --provider.cluster devnet`.
+[programs.devnet]
+batch = "29NK1pYubMLCRDi17YUGF3iMoFYyeYhxoSi6PakKdFLx"
+firm = "4ZmeSsuMU38jnc42P53gjY8d1N6WPc3LUibiboKwMaEj"
+challenge = "ENyhfPtpY1BPDFfdMmrUa4XJxuqXSeejgtGBHhhJsEBR"
+dispute = "3BTD73nYinwAf3pWR1Fw5H9avyq7dYopVARkmYi9245H"
+bonding_curve = "DeabUFkCGWWG9CHyDAeYMj9anLmguFacvBnMidpkkxBU"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "npm run test"

@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "allowJs": true,
+    "resolveJsonModule": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["mocha", "node", "chai"]
+  },
+  "include": ["tests/**/*.ts"]
+}

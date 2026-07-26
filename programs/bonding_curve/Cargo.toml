@@ -1,0 +1,28 @@
+[package]
+name = "bonding_curve"
+version = "0.1.0"
+description = "DecentralProp bonding_curve_program — constant-product AMM with virtual-USDC seed"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "bonding_curve"
+
+[features]
+default = []
+# Enable the Raydium CP-Swap graduation CPI. OFF by default so normal builds can never graduate;
+# turn on ONLY for isolated mainnet-fork tests until the post-graduation payout path exists.
+graduation = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+solana-security-txt = "1.1.3"

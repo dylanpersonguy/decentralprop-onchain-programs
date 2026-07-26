@@ -1,0 +1,23 @@
+[workspace]
+members = ["programs/*"]
+resolver = "2"
+
+# Anchor's `#[program]`/`#[account]` macro expansion checks cfg values (anchor-debug, custom-heap,
+# custom-panic, solana) that none of these 5 crates ever declares as a Cargo feature — harmless, but
+# it's ~150 "unexpected cfg" warnings of pure framework noise per full build, exactly the kind of thing
+# that makes a real `-D warnings` CI gate uninhabitable. Declaring them as known removes the noise
+# without a blanket `#[allow(unexpected_cfgs)]` that would also hide a genuinely typo'd cfg elsewhere.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [
+    "cfg(feature, values(\"anchor-debug\", \"custom-heap\", \"custom-panic\", \"solana\"))",
+] }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

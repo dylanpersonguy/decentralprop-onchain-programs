@@ -1,0 +1,34 @@
+[package]
+name = "firm"
+version = "0.1.0"
+description = "DecentralProp firm_program — FirmState lifecycle + autonomous risk-tier updates"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "firm"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = [
+    "anchor-lang/idl-build",
+    "anchor-spl/idl-build",
+    "bonding_curve/idl-build",
+    "challenge/idl-build",
+    "dispute/idl-build",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.1", features = ["metadata"] }
+solana-security-txt = "1.1.3"
+bonding_curve = { path = "../bonding_curve", features = ["cpi"] }
+challenge = { path = "../challenge", features = ["cpi"] }
+dispute = { path = "../dispute", features = ["cpi"] }

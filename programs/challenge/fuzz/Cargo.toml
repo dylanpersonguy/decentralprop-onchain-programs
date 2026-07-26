@@ -1,0 +1,35 @@
+# Coverage-guided (libFuzzer) fuzz crate for the settlement engine + Merkle + fault verifiers.
+# Standalone workspace (own `[workspace]`) so the onchain SBF build never touches it.
+# Run: cargo +nightly fuzz run settlement_soundness --sanitizer none -- -max_total_time=120
+[package]
+name = "challenge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# The settlement logic under test. `fuzzing` exposes `settlement::fuzz_support`; `no-entrypoint` keeps
+# anchor from emitting a Solana entrypoint that would clash with libFuzzer's `main`.
+challenge = { path = "..", features = ["fuzzing", "no-entrypoint"] }
+
+[[bin]]
+name = "settlement_soundness"
+path = "fuzz_targets/settlement_soundness.rs"
+test = false
+doc = false
+bench = false
+
+# Keep overflow-checks ON so an integer-overflow panic (the class the cargo-test harness caught) is a
+# fuzzer-reportable crash, and optimise so the fuzzer explores quickly.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+opt-level = 3
+
+# Standalone workspace — do NOT join the onchain workspace.
+[workspace]
