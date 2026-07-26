@@ -20,9 +20,9 @@ solana_security_txt::security_txt! {
     name: "DecentralProp: Challenge",
     project_url: "https://decentralprop.com",
     contacts: "email:security@decentralprop.com",
-    policy: "https://github.com/dylanpersonguy/DecentralProp/blob/main/SECURITY.md",
+    policy: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/blob/main/SECURITY.md",
     preferred_languages: "en",
-    source_code: "https://github.com/dylanpersonguy/DecentralProp/tree/main/onchain/programs/challenge",
+    source_code: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/tree/main/programs/challenge",
     source_release: "devnet"
 }
 

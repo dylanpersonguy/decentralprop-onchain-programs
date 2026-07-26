@@ -28,9 +28,9 @@ solana_security_txt::security_txt! {
     name: "DecentralProp: Firm",
     project_url: "https://decentralprop.com",
     contacts: "email:security@decentralprop.com",
-    policy: "https://github.com/dylanpersonguy/DecentralProp/blob/main/SECURITY.md",
+    policy: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/blob/main/SECURITY.md",
     preferred_languages: "en",
-    source_code: "https://github.com/dylanpersonguy/DecentralProp/tree/main/onchain/programs/firm",
+    source_code: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/tree/main/programs/firm",
     source_release: "devnet"
 }
 
