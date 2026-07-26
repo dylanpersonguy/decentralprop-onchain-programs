@@ -45,13 +45,42 @@ solana-verify verify-from-repo \
   -u <mainnet-beta|devnet> \
   --program-id <PROGRAM_ID> \
   https://github.com/dylanpersonguy/decentralprop-onchain-programs \
-  --commit-hash <COMMIT_SHA>
+  --commit-hash <COMMIT_SHA> \
+  --library-name <program>
 
-# Submit the result to the shared registry the Explorer/Solscan/SolanaFM badges read from:
+# The shared registry Explorer/Solscan/SolanaFM badges read from only accepts
+# mainnet submissions — this step is a no-op on devnet/localnet:
 solana-verify remote submit-job --program-id <PROGRAM_ID> --uploader <YOUR_PUBKEY>
 ```
 
 Repeat per program (`firm`, `batch`, `challenge`, `dispute`, `bonding_curve`).
+
+**⚠️ The deployed binary must itself have been built with `solana-verify build` (or
+`anchor build --verifiable`), not a plain `anchor build`.** Two builds from identical
+source are NOT guaranteed to be bit-for-bit identical across different host platforms/
+toolchains — a native `anchor build` on macOS/arm64 reliably produces different bytes
+than `solana-verify`'s own pinned Linux x86_64 Docker build, even with the exact same
+`Cargo.lock`. This isn't a hypothetical: it's exactly what happened deploying these
+programs from a plain `anchor build` — every verify came back a hash mismatch until
+the affected program was rebuilt with `solana-verify build` and redeployed. If a
+program you expect to verify cleanly doesn't, rebuild and redeploy it with:
+
+```bash
+solana-verify build <path-to-onchain-workspace> --library-name <program>
+solana program deploy target/deploy/<program>.so --program-id <PROGRAM_ID> -u <cluster>
+```
+
+**`challenge` is a special case on devnet:** it runs an intentional `devnet-fast`
+Cargo feature there (a 5-minute fraud-proof window instead of production's 72 hours),
+so verifying it must build with the same feature the deployment actually used:
+
+```bash
+solana-verify verify-from-repo -u devnet --program-id <CHALLENGE_ID> \
+  https://github.com/dylanpersonguy/decentralprop-onchain-programs \
+  --commit-hash <COMMIT_SHA> --library-name challenge -- --features devnet-fast
+```
+
+Mainnet never runs `devnet-fast` — a plain verify (no extra features) is correct there.
 
 ## Staying in sync
 
