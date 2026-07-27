@@ -96,6 +96,7 @@ pub mod firm {
         firm.supply_distributed = false;
         firm.payout_firma_vault = Pubkey::default();
         firm.stakeholder_config = StakeholderConfig::default();
+        firm.backstop_pool_bps = DEFAULT_BACKSTOP_POOL_BPS;
         firm.open_payouts = 0;
         firm.firma_buyback_acc = 0;
         firm.post_grad_lp_acc = 0;
@@ -934,6 +935,7 @@ pub mod firm {
         // Load payout-split config and settlement tier before the buy so the universal
         // SOL carve can execute first.
         let cfg = ctx.accounts.firm_state.stakeholder_config;
+        let backstop_pool_bps = ctx.accounts.firm_state.backstop_pool_bps;
         let qp_tier = risk_tier_from_u8(ctx.accounts.queued_payout.settlement_tier);
         let split = payout_tier_split(qp_tier);
 
@@ -1003,7 +1005,7 @@ pub mod firm {
         // burned, treasury reserve left in the staging vault (already firm-owned).
         // `split_stakeholder` renormalises by (10000 - universal_sol_bps) so each $FIRMA
         // leg gets the correct fraction of the *original* stakeholder notional.
-        let sh = split_stakeholder(stakeholder_deliver, &cfg);
+        let sh = split_stakeholder(stakeholder_deliver, &cfg, backstop_pool_bps);
         ctx.accounts.pay_firma(ctx.accounts.owner_firma.to_account_info(), sh.owner)?;
         ctx.accounts.pay_firma(ctx.accounts.staking_vault.to_account_info(), sh.staking)?;
         if let Some(backstop_vault) = ctx.accounts.backstop_firma_reward_vault.as_ref() {
@@ -1181,6 +1183,7 @@ pub mod firm {
         require!(sol_amount <= firm.treasury_sol, FirmError::InsufficientTreasury);
 
         let cfg = firm.stakeholder_config;
+        let backstop_pool_bps = firm.backstop_pool_bps;
         let tier = firm.risk_tier;
         let split = payout_tier_split(tier);
 
@@ -1214,7 +1217,7 @@ pub mod firm {
         };
 
         ctx.accounts.pay_firma(ctx.accounts.trader_firma.to_account_info(), trader_deliver)?;
-        let sh = split_stakeholder(stakeholder_deliver, &cfg);
+        let sh = split_stakeholder(stakeholder_deliver, &cfg, backstop_pool_bps);
         ctx.accounts.pay_firma(ctx.accounts.owner_firma.to_account_info(), sh.owner)?;
         ctx.accounts.pay_firma(ctx.accounts.staking_vault.to_account_info(), sh.staking)?;
         if let Some(backstop_vault) = ctx.accounts.backstop_firma_reward_vault.as_ref() {
@@ -2619,6 +2622,15 @@ pub mod firm {
             data[token_gen - 2] = 1; // token_live = true
             data[token_gen - 1] = 0; // token_pending = false
         }
+        {
+            // `backstop_pool_bps` (2026-07-27 staking rebalance) is the LAST field in `FirmState`,
+            // so this resize always zero-fills it for a firm migrating across this boundary — but 0
+            // silently zeroes out the intended 5% leg rather than defaulting it, unlike every other
+            // appended field here whose zero-default IS the correct value. Backfill the real default.
+            let mut data = ai.try_borrow_mut_data()?;
+            let bps_offset = full - 2;
+            data[bps_offset..full].copy_from_slice(&DEFAULT_BACKSTOP_POOL_BPS.to_le_bytes());
+        }
         Ok(())
     }
 
@@ -3391,9 +3403,14 @@ pub mod firm {
     pub fn update_stakeholder_config(
         ctx: Context<UpdateStakeholderConfig>,
         config: StakeholderConfig,
+        backstop_pool_bps: u16,
     ) -> Result<()> {
-        require!(validate_stakeholder_config(&config), FirmError::InvalidStakeholderConfig);
+        require!(
+            validate_stakeholder_config(&config, backstop_pool_bps),
+            FirmError::InvalidStakeholderConfig
+        );
         ctx.accounts.firm_state.stakeholder_config = config;
+        ctx.accounts.firm_state.backstop_pool_bps = backstop_pool_bps;
         Ok(())
     }
 
@@ -3904,6 +3921,11 @@ pub const MAX_AFFILIATE_BPS: u16 = 2000; // 20%
 /// under the old 6% (or the pre-lock 4.5%) still carves the CURRENT constant, never its stored value
 /// (see the `compute_fee_split` call site).
 pub const DEFAULT_BACKSTOP_PREMIUM_BPS: u16 = 800; // 8% — the single, fixed backstop premium rate
+/// Default `FirmState.backstop_pool_bps` (2026-07-27 staking rebalance) — the backstop pool's
+/// $FIRMA yield leg, seeded at `deploy_firm` and settable in range via `update_stakeholder_config`
+/// (500..=3000, mirrors `StakeholderConfig.staking_pool_bps`'s band). A sibling of
+/// `StakeholderConfig`, not a field inside it — see that struct's doc comment for why.
+pub const DEFAULT_BACKSTOP_POOL_BPS: u16 = 500; // 5%
 /// The loss-back redemption gate is FIXED platform-wide at 1,000,000 $FIRMA. It is not
 /// operator-configurable: `deploy_firm` seeds this on the firm state and `set_loss_back_min_stake`
 /// rejects any other value (`LossBackMinStakeLocked`), so it can only ever re-assert this amount.
@@ -4388,8 +4410,9 @@ pub struct StakeholderSplit {
     pub treasury_reserve: u64,
 }
 
-/// Split the stakeholder $FIRMA share five ways per `StakeholderConfig`. The treasury
-/// reserve absorbs rounding so the parts always sum to `amount`.
+/// Split the stakeholder $FIRMA share five ways per `StakeholderConfig` plus the sibling
+/// `FirmState.backstop_pool_bps` leg. The treasury reserve absorbs rounding so the parts
+/// always sum to `amount`.
 ///
 /// `amount` is the $FIRMA delivered AFTER the `universal_sol_bps` carve has already been
 /// extracted as SOL (pre-buy). The five $FIRMA bps are specified relative to the FULL
@@ -4402,7 +4425,10 @@ pub struct StakeholderSplit {
 /// When called from backstop/draw_universal paths (no SOL carve), `amount` is the FULL
 /// stakeholder FIRMA value; the same renormalization proportionally redistributes the
 /// 40% that would have gone to universal_sol among the five $FIRMA legs.
-pub fn split_stakeholder(amount: u64, cfg: &StakeholderConfig) -> StakeholderSplit {
+///
+/// `backstop_pool_bps` is `FirmState.backstop_pool_bps` (a sibling field, not part of
+/// `StakeholderConfig` — see the note on that struct for why) — pass `firm_state.backstop_pool_bps`.
+pub fn split_stakeholder(amount: u64, cfg: &StakeholderConfig, backstop_pool_bps: u16) -> StakeholderSplit {
     let firma_basis = (10_000u32).saturating_sub(cfg.universal_sol_bps as u32) as u128;
     let owner = if firma_basis == 0 { 0 } else {
         ((amount as u128 * cfg.owner_share_bps as u128) / firma_basis) as u64
@@ -4411,7 +4437,7 @@ pub fn split_stakeholder(amount: u64, cfg: &StakeholderConfig) -> StakeholderSpl
         ((amount as u128 * cfg.staking_pool_bps as u128) / firma_basis) as u64
     };
     let backstop = if firma_basis == 0 { 0 } else {
-        ((amount as u128 * cfg.backstop_pool_bps as u128) / firma_basis) as u64
+        ((amount as u128 * backstop_pool_bps as u128) / firma_basis) as u64
     };
     let buyback_burn = if firma_basis == 0 { 0 } else {
         ((amount as u128 * cfg.buyback_burn_bps as u128) / firma_basis) as u64
@@ -4424,21 +4450,22 @@ pub fn split_stakeholder(amount: u64, cfg: &StakeholderConfig) -> StakeholderSpl
     StakeholderSplit { owner, staking, backstop, buyback_burn, treasury_reserve }
 }
 
-/// Validate a `StakeholderConfig` against the §19 governance ranges (sum == 10000,
-/// per-field bounds, buyback/burn never zeroed, universal_sol capped at 60%).
-/// `backstop_pool_bps` (2026-07-27) mirrors `staking_pool_bps`'s range exactly — same kind
-/// of leg, just a different destination pool.
-pub fn validate_stakeholder_config(cfg: &StakeholderConfig) -> bool {
+/// Validate a `StakeholderConfig` + the sibling `backstop_pool_bps` leg against the §19
+/// governance ranges (combined sum == 10000, per-field bounds, buyback/burn never zeroed,
+/// universal_sol capped at 60%). `backstop_pool_bps` (2026-07-27, `FirmState`-level — see the
+/// note on `StakeholderConfig`) mirrors `staking_pool_bps`'s range exactly — same kind of leg,
+/// just a different destination pool.
+pub fn validate_stakeholder_config(cfg: &StakeholderConfig, backstop_pool_bps: u16) -> bool {
     let sum = cfg.owner_share_bps as u32
         + cfg.staking_pool_bps as u32
-        + cfg.backstop_pool_bps as u32
+        + backstop_pool_bps as u32
         + cfg.buyback_burn_bps as u32
         + cfg.treasury_reserve_bps as u32
         + cfg.universal_sol_bps as u32;
     sum == 10_000
         && (1000..=5000).contains(&cfg.owner_share_bps)
         && (500..=3000).contains(&cfg.staking_pool_bps)
-        && (500..=3000).contains(&cfg.backstop_pool_bps)
+        && (500..=3000).contains(&backstop_pool_bps)
         && (300..=2000).contains(&cfg.buyback_burn_bps)
         && cfg.treasury_reserve_bps <= 2000
         && cfg.universal_sol_bps <= 6000
@@ -5957,7 +5984,7 @@ pub struct SyncFirmaYield<'info> {
 }
 
 /// Permissionless: fold $FIRMA that has arrived in the backstop pool's `firma_reward_vault`
-/// (from `StakeholderConfig.backstop_pool_bps` on funded-trader payouts) into `acc_firma`.
+/// (from `FirmState.backstop_pool_bps` on funded-trader payouts) into `acc_firma`.
 /// Mirrors `SyncFirmaYield` exactly, one field over.
 #[derive(Accounts)]
 pub struct SyncBackstopFirmaYield<'info> {
@@ -7554,7 +7581,7 @@ pub struct InitBackstopPool<'info> {
     )]
     pub premium_vault: Box<Account<'info, TokenAccount>>,
     /// 2026-07-27 staking rebalance: the $FIRMA-denominated counterpart to `premium_vault`,
-    /// funded by `StakeholderConfig.backstop_pool_bps` on funded-trader payouts.
+    /// funded by `FirmState.backstop_pool_bps` on funded-trader payouts.
     #[account(
         init,
         payer = payer,
@@ -8786,6 +8813,14 @@ pub struct FirmState {
     /// permanently-locked LP. Appended AFTER `ulp_drawn` (append-only migration discipline; zero-fills
     /// to 0 = "nothing pending" for an existing firm).
     pub post_grad_lp_acc: u64,
+    /// Backstop pool's $FIRMA yield leg (2026-07-27 staking rebalance) — bps of the stakeholder
+    /// FIRMA basis, same governance range as `stakeholder_config.staking_pool_bps` (500..=3000).
+    /// A SIBLING of `stakeholder_config`, not a field inside it — appended here, at the true tail
+    /// of `FirmState`, on purpose: `stakeholder_config` sits mid-struct, and the resize-only
+    /// `migrate_firm_permissionless` migration can only safely extend a buffer's END. Zero-fills to
+    /// 0 for an existing firm on migration (matches every other appended default here); combined
+    /// with `stakeholder_config`, `validate_stakeholder_config` requires the union to sum to 10000.
+    pub backstop_pool_bps: u16,
 }
 
 #[repr(u8)]
@@ -8823,26 +8858,32 @@ pub struct StakeholderConfig {
     /// Fraction of the stakeholder SOL notional routed to the Universal Treasury Pool
     /// before the curve buy (pre-buy SOL carve). 0 = disabled; max 6000 (60%).
     pub universal_sol_bps: u16,
-    /// 2026-07-27 staking rebalance: the backstop pool's $FIRMA yield leg — same FIRMA-basis
-    /// renormalization as `staking_pool_bps`, just a distinct destination (the backstop pool's
-    /// `firma_reward_vault` instead of the no-risk pool's). Halving `staking_pool_bps` and handing
-    /// the freed half to this field keeps the FIRMA basis sum unchanged.
-    pub backstop_pool_bps: u16,
 }
+// NOTE (2026-07-27 staking rebalance, POST-INCIDENT): the backstop pool's $FIRMA yield leg is
+// `FirmState.backstop_pool_bps` — a SIBLING field on `FirmState`, deliberately NOT a 6th field
+// here. `StakeholderConfig` is embedded MID-STRUCT inside `FirmState` (see `stakeholder_config`
+// below), not appended at its end — the append-only resize migration (`migrate_firm_permissionless`)
+// only extends a buffer's tail and zero-fills the new bytes; it does NOT shift existing bytes. A
+// field added HERE (inside the embedded struct) silently shifts every FirmState field declared
+// after `stakeholder_config` (bump, token_live, bond_funded, …) by its width, misreading them from
+// the wrong offset on every pre-existing account — caught live on devnet while writing this same
+// change (AccountDidNotDeserialize, then a corrupted `bump` on re-migration) before it ever reached
+// mainnet. Any future per-firm config value MUST be appended as its own new trailing `FirmState`
+// field (like `backstop_pool_bps` below), never inserted into this embedded struct.
 
 impl Default for StakeholderConfig {
     fn default() -> Self {
-        // §19 defaults, 2026-07-27 staking rebalance: 30% owner / 5% no-risk staking / 5% backstop
-        // staking (new; was 10% no-risk / 0% backstop) / 10% buyback+burn / 10% treasury / 40%
-        // universal SOL. FIRMA basis (10000 - universal_sol_bps = 6000) still sums correctly:
-        // 3000 + 500 + 500 + 1000 + 1000 = 6000.
+        // §19 defaults, 2026-07-27 staking rebalance: 30% owner / 5% no-risk staking (was 10%,
+        // freed 5% now funds FirmState.backstop_pool_bps) / 10% buyback+burn / 10% treasury / 40%
+        // universal SOL. FIRMA basis (10000 - universal_sol_bps = 6000) sums: 3000+500+1000+1000=5500
+        // — deliberately 500 short of 6000; that remaining 500 is `FirmState.backstop_pool_bps`, not
+        // part of this struct. `validate_stakeholder_config` checks the two together.
         Self {
             owner_share_bps: 3000,
             staking_pool_bps: 500,
             buyback_burn_bps: 1000,
             treasury_reserve_bps: 1000,
             universal_sol_bps: 4000,
-            backstop_pool_bps: 500,
         }
     }
 }
@@ -9209,7 +9250,7 @@ pub struct BackstopPool {
     /// Unix day (`ts / 86_400`) that `daily_withdrawn` accrues against.
     pub withdraw_day: i64,
     /// $FIRMA yield per staked token, scaled by PRECISION (2026-07-27 staking rebalance —
-    /// mirrors StakingPool's `acc_firma`). Funded by `StakeholderConfig.backstop_pool_bps` on
+    /// mirrors StakingPool's `acc_firma`). Funded by `FirmState.backstop_pool_bps` on
     /// every funded-trader payout, folded in by the permissionless `sync_backstop_firma_yield`.
     /// Divides by `total_premium_weight` (nominal), NOT `total_staked` — same reasoning as
     /// `premium_acc`: a draw must not shrink the denominator other stakers' pending yield is
@@ -10876,7 +10917,7 @@ mod tests {
         //   treasury = remainder          ≈ 16.7%
         let cfg = StakeholderConfig::default();
         let amount = 6_000_000u64; // represents the 60% $FIRMA residual
-        let s = split_stakeholder(amount, &cfg);
+        let s = split_stakeholder(amount, &cfg, DEFAULT_BACKSTOP_POOL_BPS);
         assert_eq!(s.owner, 3_000_000); // 50% of 6M
         assert_eq!(s.staking, 500_000); // 500/6000 * 6M
         assert_eq!(s.backstop, 500_000); // 500/6000 * 6M
@@ -10889,24 +10930,23 @@ mod tests {
     fn stakeholder_split_rounding_absorbed_by_reserve() {
         let cfg = StakeholderConfig::default();
         let amount = 6_000_001u64; // odd → reserve takes the remainder
-        let s = split_stakeholder(amount, &cfg);
+        let s = split_stakeholder(amount, &cfg, DEFAULT_BACKSTOP_POOL_BPS);
         assert_eq!(s.owner + s.staking + s.backstop + s.buyback_burn + s.treasury_reserve, amount);
     }
 
     #[test]
     fn stakeholder_split_zero_universal_uses_raw_bps() {
         // When universal_sol_bps = 0, firma_basis = 10000 and raw bps apply directly.
-        // backstop_pool_bps = 0 here — this fixture predates the 2026-07-27 backstop leg and isn't
-        // testing it; kept at 0 so the other four legs' expected values stay exactly as before.
+        // backstop_pool_bps (sibling field, passed separately below) = 0 — not under test here;
+        // kept at 0 so the other four legs' expected values stay exactly as before.
         let cfg = StakeholderConfig {
             owner_share_bps: 5000,
             staking_pool_bps: 2000,
-            backstop_pool_bps: 0,
             buyback_burn_bps: 1500,
             treasury_reserve_bps: 1500,
             universal_sol_bps: 0,
         };
-        let s = split_stakeholder(10_000_000, &cfg);
+        let s = split_stakeholder(10_000_000, &cfg, 0);
         assert_eq!(s.owner, 5_000_000);
         assert_eq!(s.staking, 2_000_000);
         assert_eq!(s.backstop, 0);
@@ -11761,56 +11801,54 @@ mod tests {
 
     #[test]
     fn stakeholder_config_validation() {
-        assert!(validate_stakeholder_config(&StakeholderConfig::default()));
+        // `backstop_pool_bps` (2026-07-27 staking rebalance) is a SIBLING FirmState field, not part
+        // of `StakeholderConfig` (see that struct's doc comment for why) — passed as a separate
+        // argument to both `split_stakeholder` and `validate_stakeholder_config`.
+        assert!(validate_stakeholder_config(&StakeholderConfig::default(), DEFAULT_BACKSTOP_POOL_BPS));
         // Sum != 10000 (universal_sol one short). backstop_pool_bps: 0 is itself out of its own
         // (500..=3000) bound, but that's moot — the sum check alone already fails this.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 3000,
             staking_pool_bps: 1000,
-            backstop_pool_bps: 0,
             buyback_burn_bps: 1000,
             treasury_reserve_bps: 1000,
             universal_sol_bps: 3999, // sum = 9999
-        }));
+        }, 0));
         // buyback_burn below the 3% (300 bps) floor (cannot zero the deflationary mechanism).
         // staking/backstop split the old 1000 in half (500 each) so the sum stays isolated to this
         // one violation.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 3000,
             staking_pool_bps: 500,
-            backstop_pool_bps: 500,
             buyback_burn_bps: 200, // below 300
             treasury_reserve_bps: 1000,
             universal_sol_bps: 4800, // sum = 10000
-        }));
+        }, 500));
         // owner above the 50% (5000 bps) ceiling.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 5001, // above 5000
             staking_pool_bps: 500,
-            backstop_pool_bps: 500,
             buyback_burn_bps: 300,
             treasury_reserve_bps: 0,
             universal_sol_bps: 3699, // sum = 10000
-        }));
+        }, 500));
         // universal_sol above 60% (6000 bps) ceiling.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 1000,
             staking_pool_bps: 500,
-            backstop_pool_bps: 500,
             buyback_burn_bps: 300,
             treasury_reserve_bps: 200,
             universal_sol_bps: 7500, // above 6000; sum = 10000
-        }));
+        }, 500));
         // Minimum valid: operator-centric with universal disabled. staking/backstop split the old
         // 3000 ceiling in half (1500 each) so both stay within their own (500..=3000) bound.
         assert!(validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 5000,
             staking_pool_bps: 1500,
-            backstop_pool_bps: 1500,
             buyback_burn_bps: 2000,
             treasury_reserve_bps: 0,
             universal_sol_bps: 0,
-        }));
+        }, 1500));
     }
 
     // ───────────────────── F-M-5: backstop premium SOLVENCY property test ─────────────────────

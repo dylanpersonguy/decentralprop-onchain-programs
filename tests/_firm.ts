@@ -85,13 +85,8 @@ export async function deployFirm(
     .signers([owner])
     .rpc();
 
-  // 2b) init_loss_back_vault — PDA-owned SOL accumulator for the 2% loss-back leg. Required by
-  // pay_challenge_fee (the leg routes here); the vault auto-resolves from ["loss_back_vault", firm].
-  await programs.firm.methods
-    .initLossBackVault()
-    .accountsPartial({ payer: owner.publicKey, firmState: firm, solMint })
-    .signers([owner])
-    .rpc();
+  // 2b) Loss-back credit (2026-07-27 staking rebalance): purely notional now, no vault to init —
+  // the per-trader ledger is created lazily (init-if-needed) inside pay_challenge_fee itself.
 
   // 3) initialize_curve — virtual-SOL-seeded AMM + its two vaults.
   await programs.bondingCurve.methods
