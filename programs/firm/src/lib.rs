@@ -312,38 +312,45 @@ pub mod firm {
             }
             _ => 0,
         };
-        let split = apply_treasury_health_adjustment(
-            compute_fee_split(
-                amount,
-                owner_bps_for_tier(firm_tier),
-                lp_bps,
-                premium_bps,
-                affiliate_bps,
-            ),
-            amount,
-            firm_tier,
-            ctx.accounts.firm_state.treasury_sol,
-        );
-        let now = Clock::get()?.unix_timestamp;
-
-        // Loss-back credit application — the ONLY path for credits to be used.
-        // If the trader passes their staker_position and meets the min-stake gate, we draw
-        // up to 50% of the fee from the loss-back vault into their SOL account so the
-        // subsequent xfers net a discounted effective payment. Credits cannot be cashed out
-        // directly; they are strictly a purchase-price discount.
+        // Loss-back credit application (2026-07-27 staking rebalance) — computed BEFORE the fee
+        // split, against the ORIGINAL `amount`, so the discount reduces every leg proportionally
+        // instead of being refunded from a side vault. `LossBackCredit.balance` is now purely
+        // notional (no backing vault, no token transfer here) — redeeming it just charges the
+        // trader less. Gate is now stake-TIER, not a fixed bps-of-stake formula: staking
+        // `loss_back_min_stake` $FIRMA in EITHER pool (no-risk or backstop) unlocks redeeming up to
+        // 100% of the accrued balance, still capped at 50% of THIS purchase (unchanged safety rail
+        // — never a fully-free evaluation regardless of how much credit is banked).
         let discount = {
             let credit = &ctx.accounts.loss_back_credit;
             let min_stake = ctx.accounts.firm_state.loss_back_min_stake;
-            let staked = ctx.accounts.staker_position.as_ref()
+            let no_risk_staked = ctx.accounts.staker_position.as_ref()
                 .map(|p| p.amount_staked).unwrap_or(0);
-            if staked >= min_stake && credit.balance > 0 {
+            let backstop_staked = ctx.accounts.backstop_position.as_ref()
+                .map(|p| p.amount_staked).unwrap_or(0);
+            let eligible = no_risk_staked >= min_stake || backstop_staked >= min_stake;
+            if eligible && credit.balance > 0 {
                 credit.balance.min(amount / 2) // 50% cap — prevents fully-free evaluations
             } else {
                 0
             }
         };
+        let effective_amount = amount.saturating_sub(discount);
+
+        let split = apply_treasury_health_adjustment(
+            compute_fee_split(
+                effective_amount,
+                owner_bps_for_tier(firm_tier),
+                lp_bps,
+                premium_bps,
+                affiliate_bps,
+            ),
+            effective_amount,
+            firm_tier,
+            ctx.accounts.firm_state.treasury_sol,
+        );
+        let now = Clock::get()?.unix_timestamp;
+
         if discount > 0 {
-            ctx.accounts.draw_credit(discount)?;
             let credit = &mut ctx.accounts.loss_back_credit;
             credit.balance = credit.balance.saturating_sub(discount);
             credit.lifetime_redeemed = credit
@@ -417,11 +424,13 @@ pub mod firm {
             ctx.accounts.route_lp(split.lp)?;
         }
 
-        // Loss-back comeback credit (flywheel) — route the 3% into the firm's loss-back vault and
-        // credit the buyer's per-trader `LossBackCredit` (init'd lazily on first purchase). The slice
-        // accrues unconditionally; redemption is what's gated on staking (`redeem_loss_back_credit`).
-        ctx.accounts.xfer(ctx.accounts.loss_back_vault.to_account_info(), split.loss_back)?;
+        // Loss-back comeback credit (flywheel, 2026-07-27 staking rebalance) — a PURELY NOTIONAL
+        // accrual on the buyer's per-trader `LossBackCredit` (init'd lazily on first purchase), no
+        // vault, no token transfer. Accrues unconditionally on what was actually charged
+        // (`effective_amount`, i.e. net of any discount already applied above this purchase);
+        // redemption is gated on staking (see the discount block above).
         {
+            let loss_back_accrual = bps(effective_amount, LOSS_BACK_BPS);
             let credit = &mut ctx.accounts.loss_back_credit;
             if credit.trader == Pubkey::default() {
                 credit.firm = ctx.accounts.firm_state.key();
@@ -429,13 +438,13 @@ pub mod firm {
                 credit.bump = ctx.bumps.loss_back_credit;
             }
             credit.balance =
-                credit.balance.checked_add(split.loss_back).ok_or(FirmError::MathOverflow)?;
+                credit.balance.checked_add(loss_back_accrual).ok_or(FirmError::MathOverflow)?;
             credit.lifetime_accrued =
-                credit.lifetime_accrued.checked_add(split.loss_back).ok_or(FirmError::MathOverflow)?;
+                credit.lifetime_accrued.checked_add(loss_back_accrual).ok_or(FirmError::MathOverflow)?;
             emit!(LossBackAccrued {
                 firm: ctx.accounts.firm_state.key(),
                 trader: ctx.accounts.trader.key(),
-                amount: split.loss_back,
+                amount: loss_back_accrual,
                 balance: credit.balance,
             });
         }
@@ -997,6 +1006,11 @@ pub mod firm {
         let sh = split_stakeholder(stakeholder_deliver, &cfg);
         ctx.accounts.pay_firma(ctx.accounts.owner_firma.to_account_info(), sh.owner)?;
         ctx.accounts.pay_firma(ctx.accounts.staking_vault.to_account_info(), sh.staking)?;
+        if let Some(backstop_vault) = ctx.accounts.backstop_firma_reward_vault.as_ref() {
+            ctx.accounts.pay_firma(backstop_vault.to_account_info(), sh.backstop)?;
+        }
+        // No backstop pool for this firm: `sh.backstop` simply stays in the staging vault,
+        // same as any other undistributed stakeholder residual.
         ctx.accounts.burn_firma(sh.buyback_burn)?;
 
         // Treasury accounting: reload and re-sync (§19).
@@ -1203,6 +1217,11 @@ pub mod firm {
         let sh = split_stakeholder(stakeholder_deliver, &cfg);
         ctx.accounts.pay_firma(ctx.accounts.owner_firma.to_account_info(), sh.owner)?;
         ctx.accounts.pay_firma(ctx.accounts.staking_vault.to_account_info(), sh.staking)?;
+        if let Some(backstop_vault) = ctx.accounts.backstop_firma_reward_vault.as_ref() {
+            ctx.accounts.pay_firma(backstop_vault.to_account_info(), sh.backstop)?;
+        }
+        // No backstop pool for this firm: `sh.backstop` simply stays in the staging vault,
+        // same as any other undistributed stakeholder residual.
         ctx.accounts.burn_firma(sh.buyback_burn)?;
 
         ctx.accounts.treasury_vault.reload()?;
@@ -1418,17 +1437,15 @@ pub mod firm {
 
         let treasury_amount = ctx.accounts.treasury_vault.amount;
         let insurance_amount = ctx.accounts.insurance_vault.amount;
-        let loss_back_amount = ctx.accounts.loss_back_vault.amount;
+        // No more loss_back_vault to sweep (2026-07-27 staking rebalance) — comeback credit is a
+        // purely notional per-trader counter now, never a real balance sitting in a firm vault.
 
         // Everything → the Universal Pool (repay the commons). No owner leg. The firm PDA authorizes each.
         let uni = ctx.accounts.universal_vault.to_account_info();
         ctx.accounts.from_treasury(uni.clone(), treasury_amount)?;
-        ctx.accounts.from_insurance(uni.clone(), insurance_amount)?;
-        ctx.accounts.from_loss_back(uni, loss_back_amount)?;
+        ctx.accounts.from_insurance(uni, insurance_amount)?;
 
-        let swept = treasury_amount
-            .saturating_add(insurance_amount)
-            .saturating_add(loss_back_amount);
+        let swept = treasury_amount.saturating_add(insurance_amount);
         ctx.accounts.universal_pool.total_contributed = ctx
             .accounts
             .universal_pool
@@ -1656,15 +1673,30 @@ pub mod firm {
         pool.last_premium_at = now;
         pool.premium_bps = DEFAULT_BACKSTOP_PREMIUM_BPS;
         pool.bump = ctx.bumps.backstop_pool;
+        pool.daily_withdrawn = 0;
+        pool.withdraw_day = 0;
+        pool.acc_firma = 0;
+        pool.firma_reward_accounted = 0;
+        pool.firma_reward_vault = ctx.accounts.firma_reward_vault.key();
+        pool.unallocated_firma = 0;
         Ok(())
     }
 
-    /// The backstop premium rate is FIXED platform-wide at 6% and not operator-configurable. This
+    /// The backstop premium rate is FIXED platform-wide at 8% and not operator-configurable. This
     /// instruction is retained for compatibility but rejects any rate other than the fixed rate
-    /// (`BackstopPremiumLocked`); it can only ever re-assert 6%.
+    /// (`BackstopPremiumLocked`); it can only ever re-assert 8%.
     pub fn set_backstop_premium(ctx: Context<SetBackstopPremium>, bps: u16) -> Result<()> {
         require!(bps == DEFAULT_BACKSTOP_PREMIUM_BPS, FirmError::BackstopPremiumLocked);
         ctx.accounts.backstop_pool.premium_bps = DEFAULT_BACKSTOP_PREMIUM_BPS;
+        Ok(())
+    }
+
+    /// Backfill for a `BackstopPool` created before the 2026-07-27 staking rebalance: stands up
+    /// the $FIRMA reward vault `init_backstop_pool` now creates by default and records it on the
+    /// pool. One-time, permissionless (same shape as `init_staking_pool`); a pool created after the
+    /// rebalance already has this set and calling it again fails on the `init` constraint.
+    pub fn init_backstop_firma_reward_vault(ctx: Context<InitBackstopFirmaRewardVault>) -> Result<()> {
+        ctx.accounts.backstop_pool.firma_reward_vault = ctx.accounts.firma_reward_vault.key();
         Ok(())
     }
 
@@ -1706,26 +1738,11 @@ pub mod firm {
         Ok(())
     }
 
-    /// Stand up the firm's loss-back credit vault (flywheel). One-time, permissionless: creates the
-    /// PDA-owned SOL token account at ["loss_back_vault", firm] with the firm PDA as authority — so
-    /// the only exit is `redeem_loss_back_credit`, gated on a trader's own accrued balance + stake.
-    /// MUST be run before the firm takes its first evaluation purchase (`pay_challenge_fee` routes
-    /// the 3% loss-back leg here). Mirrors `init_staking_pool` / `init_dprop_buyback`.
-    pub fn init_loss_back_vault(_ctx: Context<InitLossBackVault>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Redeem accrued loss-back credit toward a future evaluation (flywheel). Pulls `amount` SOL
-    /// from the firm `loss_back_vault` to the trader, gated on (1) the trader's `LossBackCredit`
-    /// balance and (2) the trader staking at least `FirmState.loss_back_min_stake` $FIRMA. The
-    /// per-trader balance bound means a trader can never extract more than the 3% accrued from their
-    /// own fees — it is a staker-only rebate that funds the next eval, not a yield faucet.
-    /// Loss-back credit can no longer be redeemed directly to wallet. Credits are a
-    /// purchase-price discount only — apply them by passing your `staker_position` account
-    /// to `pay_challenge_fee` when buying your next evaluation.
-    pub fn redeem_loss_back_credit(_ctx: Context<RedeemLossBackCredit>, _amount: u64) -> Result<()> {
-        err!(FirmError::CreditMustBeUsedAtPurchase)
-    }
+    /// 2026-07-27 staking rebalance: `init_loss_back_vault` and `redeem_loss_back_credit` are
+    /// REMOVED. Comeback credit is now a purely notional per-trader counter accrued and applied
+    /// entirely inside `pay_challenge_fee` (see its doc comment) — there is no vault to stand up
+    /// and no separate redemption instruction. `CreditMustBeUsedAtPurchase` is kept in
+    /// `FirmError` since old clients built against the prior IDL may still reference it.
 
     /// Stake $FIRMA into the backstop (§19). Escrows the tokens (at risk) and adjusts the
     /// position's premium + loss debt so the new principal earns no past premium and
@@ -1738,11 +1755,13 @@ pub mod firm {
 
         let pool = &mut ctx.accounts.backstop_pool;
         pool.total_staked = pool.total_staked.checked_add(amount).ok_or(FirmError::MathOverflow)?;
-        // F-M-5: nominal premium weight grows with the stake (the premium denominator).
+        // F-M-5: nominal premium weight grows with the stake (the premium AND, 2026-07-27, the
+        // $FIRMA-yield denominator — same reasoning applies to both: neither may shrink on a draw).
         pool.total_premium_weight =
             pool.total_premium_weight.checked_add(amount).ok_or(FirmError::MathOverflow)?;
         let premium_acc = pool.premium_acc;
         let loss_acc = pool.loss_acc;
+        let acc_firma = pool.acc_firma;
 
         let pos = &mut ctx.accounts.position;
         if pos.staker == Pubkey::default() {
@@ -1754,6 +1773,7 @@ pub mod firm {
         pos.amount_staked = pos.amount_staked.checked_add(amount).ok_or(FirmError::MathOverflow)?;
         pos.premium_debt = pos.premium_debt.saturating_add(yield_debt(amount, premium_acc));
         pos.loss_debt = pos.loss_debt.saturating_add(yield_debt(amount, loss_acc));
+        pos.firma_debt = pos.firma_debt.saturating_add(yield_debt(amount, acc_firma));
         emit!(BackstopStaked { firm: pos.firm, staker: pos.staker, amount });
         Ok(())
     }
@@ -1819,11 +1839,16 @@ pub mod firm {
         let staked = pos_ro.amount_staked;
         let original_loss_debt = pos_ro.loss_debt;
         let original_premium_debt = pos_ro.premium_debt;
+        let original_firma_debt = pos_ro.firma_debt;
         let pending_loss_total = pending_yield(staked, pool.loss_acc, original_loss_debt);
         let surviving_total = staked.saturating_sub(pending_loss_total);
         let premium_total = pending_yield(staked, pool.premium_acc, original_premium_debt);
+        // 2026-07-27 staking rebalance: the $FIRMA yield leg, sliced by withdrawal fraction exactly
+        // like premium above (not the surviving/loss-adjusted total — yield accrues on nominal stake).
+        let firma_yield_total = pending_yield(staked, pool.acc_firma, original_firma_debt);
         let surviving_slice = ((amount as u128).saturating_mul(surviving_total as u128) / staked as u128) as u64;
         let premium_slice = ((amount as u128).saturating_mul(premium_total as u128) / staked as u128) as u64;
+        let firma_yield_slice = ((amount as u128).saturating_mul(firma_yield_total as u128) / staked as u128) as u64;
 
         // §19 anti-bank-run redemption gate: cap cumulative surviving-$FIRMA paid out per UTC day,
         // recomputed fresh off the live pool each call (same reset-then-check idiom as
@@ -1844,6 +1869,7 @@ pub mod firm {
 
         ctx.accounts.pay_firma(surviving_slice)?;
         ctx.accounts.pay_sol(premium_slice)?;
+        ctx.accounts.pay_firma_yield(firma_yield_slice)?;
 
         let pool = &mut ctx.accounts.backstop_pool;
         pool.total_staked = pool.total_staked.saturating_sub(surviving_slice);
@@ -1857,18 +1883,26 @@ pub mod firm {
         if remainder == 0 {
             pos.premium_debt = 0;
             pos.loss_debt = 0;
+            pos.firma_debt = 0;
             pos.cooldown_ends_at = 0;
             pos.cooldown_requested_at = 0;
         } else {
             // Scale the EXISTING debt down proportionally to the remaining share — do NOT reset
             // to the live accumulator (that's only correct for a genuinely fresh deposit, which
             // `stake_backstop` does). Resetting here would zero out the remainder's already-
-            // accrued, not-yet-realized pro-rata loss/premium, letting a staker escape their fair
-            // share of a draw just by withdrawing in slices instead of one shot.
+            // accrued, not-yet-realized pro-rata loss/premium/$FIRMA-yield, letting a staker escape
+            // their fair share of a draw just by withdrawing in slices instead of one shot.
             pos.premium_debt = original_premium_debt.saturating_mul(remainder as u128) / staked as u128;
             pos.loss_debt = original_loss_debt.saturating_mul(remainder as u128) / staked as u128;
+            pos.firma_debt = original_firma_debt.saturating_mul(remainder as u128) / staked as u128;
         }
-        emit!(BackstopWithdrawn { firm: pos.firm, staker: pos.staker, surviving: surviving_slice, premium: premium_slice });
+        emit!(BackstopWithdrawn {
+            firm: pos.firm,
+            staker: pos.staker,
+            surviving: surviving_slice,
+            premium: premium_slice,
+            firma_yield: firma_yield_slice,
+        });
         Ok(())
     }
 
@@ -1878,10 +1912,17 @@ pub mod firm {
         let premium =
             pending_yield(staked, ctx.accounts.backstop_pool.premium_acc, ctx.accounts.position.premium_debt);
         ctx.accounts.pay_sol(premium)?;
+        // 2026-07-27 staking rebalance: claim the $FIRMA yield leg in the same call.
+        let firma_yield =
+            pending_yield(staked, ctx.accounts.backstop_pool.acc_firma, ctx.accounts.position.firma_debt);
+        ctx.accounts.pay_firma(firma_yield)?;
         let premium_acc = ctx.accounts.backstop_pool.premium_acc;
+        let acc_firma = ctx.accounts.backstop_pool.acc_firma;
         let pos = &mut ctx.accounts.position;
         pos.premium_debt = yield_debt(staked, premium_acc);
+        pos.firma_debt = yield_debt(staked, acc_firma);
         emit!(BackstopPremiumClaimed { firm: pos.firm, staker: pos.staker, premium });
+        emit!(BackstopFirmaYieldClaimed { firm: pos.firm, staker: pos.staker, firma: firma_yield });
         Ok(())
     }
 
@@ -3327,6 +3368,24 @@ pub mod firm {
         Ok(())
     }
 
+    /// Permissionless: fold $FIRMA that has arrived in the backstop pool's `firma_reward_vault`
+    /// into `acc_firma` (§19 staking rebalance, 2026-07-27). Divides by `total_premium_weight`
+    /// (nominal), NOT `total_staked` — matching `premium_acc`'s reasoning exactly: a draw shrinks
+    /// `total_staked` but not the nominal weight other stakers' pending yield is computed against,
+    /// so folding against the wrong denominator would let `Σ firma_claimable` exceed what this sync
+    /// actually funded.
+    pub fn sync_backstop_firma_yield(ctx: Context<SyncBackstopFirmaYield>) -> Result<()> {
+        let vault_amount = ctx.accounts.firma_reward_vault.amount;
+        let pool = &mut ctx.accounts.backstop_pool;
+        let delta = vault_amount.saturating_sub(pool.firma_reward_accounted);
+        let (acc, unalloc) =
+            fold_yield(pool.acc_firma, pool.unallocated_firma, delta, pool.total_premium_weight);
+        pool.acc_firma = acc;
+        pool.unallocated_firma = unalloc;
+        pool.firma_reward_accounted = vault_amount;
+        Ok(())
+    }
+
     /// Owner-adjustable stakeholder-share ratios (§19), validated against the governance
     /// ranges (sum 10000; buyback/burn never below 3%). Signed by the firm owner.
     pub fn update_stakeholder_config(
@@ -3790,7 +3849,10 @@ pub const BOND_FUNDING_BPS: u16 = 100; // 1%
 // every challenge fee. Each routes SOL to an accumulator token account (mirrors the dp_profit /
 // dp_treasury wallets) to be consumed later by the staking-reward and $DPROP-buyback instructions
 // (deferred). $DPROP is the protocol's native token, separate from per-firm $FIRMA.
-pub const NORMAL_STAKING_BPS: u16 = 500; // 5% (raised from 2%; +3% from loss-back, $DPROP buy-back, $FIRMA buy-back)
+// 2026-07-27 staking rebalance: reduced 5% -> 3%, the freed 2% mirrored into
+// DEFAULT_BACKSTOP_PREMIUM_BPS (6% -> 8%) so the combined no-risk + backstop SOL carve
+// stays 11% of every eval fee — a reallocation toward the riskier pool, not a new cost.
+pub const NORMAL_STAKING_BPS: u16 = 300; // 3% (reduced from 5%; -2% shifted to backstop premium)
 pub const DPROP_BUYBACK_BPS: u16 = 100; // 1% (reduced from 2%; 1% to normal staking pool)
 
 // $DPROP staking pool (10%): fixed leg of every challenge fee routed to the protocol-level
@@ -3800,14 +3862,15 @@ pub const DPROP_BUYBACK_BPS: u16 = 100; // 1% (reduced from 2%; 1% to normal sta
 // owner -1%, LP -1%, affiliate -1% (when active), and firm treasury -2%.
 pub const DPROP_STAKING_BPS: u16 = 1000; // 10%
 
-// Loss-back credit leg (flywheel): 2% of every evaluation fee carves into a per-trader on-chain
-// "comeback" credit (the `LossBackCredit` PDA), pooled in the firm's `loss_back_vault`. Failing an
-// eval stops feeling like a dead end — the credit accrues to the buyer and is redeemable toward a
-// future eval. To keep the slice circulating inside the protocol (and to reward $FIRMA holders) the
-// credit is **only redeemable by traders staking at least `FirmState.loss_back_min_stake` $FIRMA**.
-// Carved from the firm-treasury gross slice (mirrors NORMAL_STAKING); the per-trader bound is that a
-// trader can never pull back more than was accrued from their own fees.
-pub const LOSS_BACK_BPS: u16 = 200; // 2% (reduced from 3%; 1% to normal staking pool)
+// Loss-back credit leg (flywheel). 2026-07-27 staking rebalance: NO LONGER a carved FeeSplit leg —
+// removed the dedicated `loss_back_vault` entirely (it could strand real SOL forever for a trader
+// who never met the stake gate; see `reports/2026-07-27-staking-rebalance-proposal.md`). Now a
+// PURELY NOTIONAL per-trader accrual computed directly in `pay_challenge_fee`: 2% of what the
+// trader actually pays becomes `LossBackCredit.balance`, applied as a price reduction on a later
+// purchase (never a real transfer) while the trader stakes at least `FirmState.loss_back_min_stake`
+// $FIRMA in EITHER the no-risk or the backstop pool. The per-trader bound is unchanged: a trader can
+// never redeem more than accrued from their own fees.
+pub const LOSS_BACK_BPS: u16 = 200; // 2% — now an accrual rate, not a fee-split carve
 
 // $YOURFIRM ($FIRMA) buy-back (1%): a fixed leg of every challenge fee earmarked to buy the firm's
 // own $FIRMA off the curve and hold it in the **Tier-2 treasury reserve** (`treasury_firma_vault`),
@@ -3830,10 +3893,17 @@ pub const MAX_AFFILIATE_BPS: u16 = 2000; // 20%
 
 // Backstop premium (§19): carved from the firm-treasury gross slice of each challenge fee
 // and routed atomically to the backstop premium vault. Stored per-pool, governance-adjustable.
-/// The backstop premium is FIXED platform-wide at 6%. It is not operator-configurable: `init_backstop_pool`
+/// The backstop premium is FIXED platform-wide at 8%. It is not operator-configurable: `init_backstop_pool`
 /// seeds this rate and `set_backstop_premium` rejects any other value (`BackstopPremiumLocked`); the fee
 /// split carves exactly this rate whenever a backstop pool exists.
-pub const DEFAULT_BACKSTOP_PREMIUM_BPS: u16 = 600; // 6% — the single, fixed backstop premium rate
+///
+/// 2026-07-27 staking rebalance: raised 6% -> 8% (mirrors NORMAL_STAKING_BPS's 5% -> 3% cut, so the
+/// combined no-risk + backstop SOL carve stays 11% of every eval fee). The prior 6% lock was a
+/// governance choice (freezing what used to be per-firm operator-configurable), not a safety
+/// invariant — raising the single platform-wide constant is architecturally clean; any pool created
+/// under the old 6% (or the pre-lock 4.5%) still carves the CURRENT constant, never its stored value
+/// (see the `compute_fee_split` call site).
+pub const DEFAULT_BACKSTOP_PREMIUM_BPS: u16 = 800; // 8% — the single, fixed backstop premium rate
 /// The loss-back redemption gate is FIXED platform-wide at 1,000,000 $FIRMA. It is not
 /// operator-configurable: `deploy_firm` seeds this on the firm state and `set_loss_back_min_stake`
 /// rejects any other value (`LossBackMinStakeLocked`), so it can only ever re-assert this amount.
@@ -4091,10 +4161,6 @@ pub struct FeeSplit {
     pub dprop_buyback: u64,
     /// $YOURFIRM buy-back (2%) earmarked for the Tier-2 treasury $FIRMA reserve (payouts).
     pub firma_buyback: u64,
-    /// Loss-back comeback credit (3%) — routed to the firm `loss_back_vault` and credited to the
-    /// buyer's `LossBackCredit` PDA; redeemable toward a future eval only by sufficiently-staked
-    /// traders.
-    pub loss_back: u64,
     pub affiliate_pool: u64,
     /// $DPROP staking yield (10%) — routed to the protocol-level `dprop_staking_sol` vault;
     /// distributed as SOL rewards to $DPROP stakers via the `claim_dprop_staking_yield` pull path.
@@ -4106,10 +4172,15 @@ pub struct FeeSplit {
 }
 
 /// Compute the atomic split. The backstop premium (`premium_bps`, 0 when the firm has no
-/// backstop pool) is carved from the treasury's gross slice; the fixed normal-staking (5%),
+/// backstop pool) is carved from the treasury's gross slice; the fixed normal-staking (3%),
 /// $DPROP buy-back (1%), and $DPROP staking (10%) legs are deducted; the affiliate leg
 /// (`affiliate_bps`, 0 when unreferred, else the affiliate's rate ≤ 20%) is reduced by 100bps
 /// (1% redirected to $DPROP staking); the treasury absorbs rounding so all parts sum to `amount`.
+///
+/// 2026-07-27 staking rebalance: the loss-back comeback credit is no longer a carved leg here.
+/// It's now a purely notional per-trader counter (`LossBackCredit.balance`, no backing vault)
+/// accrued directly in `pay_challenge_fee` from the amount actually charged, and applied as a
+/// price reduction on a future purchase — never a real transfer out of this split.
 pub fn compute_fee_split(
     amount: u64,
     owner_bps: u16,
@@ -4128,7 +4199,6 @@ pub fn compute_fee_split(
     let normal_staking = bps(amount, NORMAL_STAKING_BPS);
     let dprop_buyback = bps(amount, DPROP_BUYBACK_BPS);
     let firma_buyback = bps(amount, FIRMA_BUYBACK_BPS);
-    let loss_back = bps(amount, LOSS_BACK_BPS);
     // Affiliate rate is reduced by 100bps: 1% of every referred purchase is redirected to the
     // $DPROP staking pool. Unreferred purchases (affiliate_bps = 0) contribute their extra 1% via
     // the treasury remainder instead.
@@ -4148,7 +4218,6 @@ pub fn compute_fee_split(
         + normal_staking
         + dprop_buyback
         + firma_buyback
-        + loss_back
         + affiliate_pool
         + dprop_staking
         + universal;
@@ -4163,7 +4232,6 @@ pub fn compute_fee_split(
         normal_staking,
         dprop_buyback,
         firma_buyback,
-        loss_back,
         affiliate_pool,
         dprop_staking,
         universal,
@@ -4308,28 +4376,32 @@ pub fn split_delivered_firma(delivered: u64, split: &PayoutTierSplit) -> (u64, u
     (trader, delivered.saturating_sub(trader))
 }
 
-/// The four stakeholder destinations the stakeholder share of a payout splits into
-/// (§19 `StakeholderConfig`), all denominated in $FIRMA.
+/// The five stakeholder destinations the stakeholder share of a payout splits into
+/// (§19 `StakeholderConfig`), all denominated in $FIRMA. `backstop` added 2026-07-27
+/// (staking rebalance) — the backstop pool's own $FIRMA yield leg, distinct from `staking`
+/// (the no-risk pool's).
 pub struct StakeholderSplit {
     pub owner: u64,
     pub staking: u64,
+    pub backstop: u64,
     pub buyback_burn: u64,
     pub treasury_reserve: u64,
 }
 
-/// Split the stakeholder $FIRMA share four ways per `StakeholderConfig`. The treasury
+/// Split the stakeholder $FIRMA share five ways per `StakeholderConfig`. The treasury
 /// reserve absorbs rounding so the parts always sum to `amount`.
 ///
 /// `amount` is the $FIRMA delivered AFTER the `universal_sol_bps` carve has already been
-/// extracted as SOL (pre-buy). The four $FIRMA bps are specified relative to the FULL
+/// extracted as SOL (pre-buy). The five $FIRMA bps are specified relative to the FULL
 /// 10000 stakeholder notional, so they must be renormalized against the non-universal
 /// basis `(10000 - universal_sol_bps)` to distribute `amount` correctly. For the default
 /// 40% universal carve: basis = 6000; owner(3000) → 50% of amount (= 30% of original),
-/// staking(1000) → 16.7%, burn(1000) → 16.7%, treasury(1000) → 16.7% (remainder).
+/// staking(500) → 8.3%, backstop(500) → 8.3%, burn(1000) → 16.7%, treasury(1000) → 16.7%
+/// (remainder).
 ///
 /// When called from backstop/draw_universal paths (no SOL carve), `amount` is the FULL
 /// stakeholder FIRMA value; the same renormalization proportionally redistributes the
-/// 40% that would have gone to universal_sol among the four $FIRMA legs.
+/// 40% that would have gone to universal_sol among the five $FIRMA legs.
 pub fn split_stakeholder(amount: u64, cfg: &StakeholderConfig) -> StakeholderSplit {
     let firma_basis = (10_000u32).saturating_sub(cfg.universal_sol_bps as u32) as u128;
     let owner = if firma_basis == 0 { 0 } else {
@@ -4338,24 +4410,35 @@ pub fn split_stakeholder(amount: u64, cfg: &StakeholderConfig) -> StakeholderSpl
     let staking = if firma_basis == 0 { 0 } else {
         ((amount as u128 * cfg.staking_pool_bps as u128) / firma_basis) as u64
     };
+    let backstop = if firma_basis == 0 { 0 } else {
+        ((amount as u128 * cfg.backstop_pool_bps as u128) / firma_basis) as u64
+    };
     let buyback_burn = if firma_basis == 0 { 0 } else {
         ((amount as u128 * cfg.buyback_burn_bps as u128) / firma_basis) as u64
     };
-    let treasury_reserve = amount.saturating_sub(owner).saturating_sub(staking).saturating_sub(buyback_burn);
-    StakeholderSplit { owner, staking, buyback_burn, treasury_reserve }
+    let treasury_reserve = amount
+        .saturating_sub(owner)
+        .saturating_sub(staking)
+        .saturating_sub(backstop)
+        .saturating_sub(buyback_burn);
+    StakeholderSplit { owner, staking, backstop, buyback_burn, treasury_reserve }
 }
 
 /// Validate a `StakeholderConfig` against the §19 governance ranges (sum == 10000,
 /// per-field bounds, buyback/burn never zeroed, universal_sol capped at 60%).
+/// `backstop_pool_bps` (2026-07-27) mirrors `staking_pool_bps`'s range exactly — same kind
+/// of leg, just a different destination pool.
 pub fn validate_stakeholder_config(cfg: &StakeholderConfig) -> bool {
     let sum = cfg.owner_share_bps as u32
         + cfg.staking_pool_bps as u32
+        + cfg.backstop_pool_bps as u32
         + cfg.buyback_burn_bps as u32
         + cfg.treasury_reserve_bps as u32
         + cfg.universal_sol_bps as u32;
     sum == 10_000
         && (1000..=5000).contains(&cfg.owner_share_bps)
         && (500..=3000).contains(&cfg.staking_pool_bps)
+        && (500..=3000).contains(&cfg.backstop_pool_bps)
         && (300..=2000).contains(&cfg.buyback_burn_bps)
         && cfg.treasury_reserve_bps <= 2000
         && cfg.universal_sol_bps <= 6000
@@ -5184,11 +5267,9 @@ pub struct PayChallengeFee<'info> {
     #[account(mut, seeds = [b"universal_pool"], bump = universal_pool.bump)]
     pub universal_pool: Box<Account<'info, UniversalPool>>,
 
-    // Loss-back leg (flywheel) — the firm's PDA-owned SOL accumulator for the 3% comeback credit
-    // (`init_loss_back_vault` must have run first), plus the buyer's per-trader credit ledger,
-    // created lazily here on first purchase. Both PDAs are derived in the builder, not caller-chosen.
-    #[account(mut, seeds = [b"loss_back_vault", firm_state.key().as_ref()], bump)]
-    pub loss_back_vault: Box<Account<'info, TokenAccount>>,
+    // Loss-back leg (flywheel, 2026-07-27 staking rebalance) — the buyer's per-trader credit
+    // ledger, created lazily here on first purchase. Purely notional now — no backing vault, no
+    // token transfer; see the handler's discount block.
     #[account(
         init_if_needed,
         payer = trader,
@@ -5239,14 +5320,20 @@ pub struct PayChallengeFee<'info> {
     #[account(mut, token::mint = firm_state.sol_mint)]
     pub backstop_premium_vault: Option<Box<Account<'info, TokenAccount>>>,
 
-    // Loss-back credit application gate — pass the trader's staker position to unlock
-    // the purchase discount. The stake gate is checked in the handler; if omitted (or staked
-    // < min_stake) the discount is 0 and the full fee is charged.
+    // Loss-back credit application gate (2026-07-27 staking rebalance: EITHER position, not just
+    // no-risk, unlocks the discount) — pass whichever stake position(s) the trader holds. The
+    // stake gate is checked in the handler; if both are omitted (or neither meets min_stake) the
+    // discount is 0 and the full fee is charged.
     #[account(
         seeds = [b"staker", firm_state.key().as_ref(), trader.key().as_ref()],
         bump,
     )]
     pub staker_position: Option<Box<Account<'info, StakerPosition>>>,
+    #[account(
+        seeds = [b"backstop_pos", firm_state.key().as_ref(), trader.key().as_ref()],
+        bump,
+    )]
+    pub backstop_position: Option<Box<Account<'info, BackstopPosition>>>,
 
     pub bonding_curve_program: Program<'info, bonding_curve::program::BondingCurve>,
     pub token_program: Program<'info, Token>,
@@ -5267,28 +5354,6 @@ impl<'info> PayChallengeFee<'info> {
                     to,
                     authority: self.trader.to_account_info(),
                 },
-            ),
-            amount,
-        )
-    }
-
-    /// Transfer from the firm-PDA-owned loss-back vault to the trader's SOL account.
-    /// Used to apply the credit discount before the fee split runs.
-    fn draw_credit(&self, amount: u64) -> Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        let bump = [self.firm_state.bump];
-        let seeds = firm_signer(&self.firm_state.owner, &bump);
-        token::transfer(
-            CpiContext::new_with_signer(
-                self.token_program.to_account_info(),
-                anchor_spl::token::Transfer {
-                    from: self.loss_back_vault.to_account_info(),
-                    to: self.trader_sol.to_account_info(),
-                    authority: self.firm_state.to_account_info(),
-                },
-                &[&seeds],
             ),
             amount,
         )
@@ -5891,6 +5956,48 @@ pub struct SyncFirmaYield<'info> {
     pub firma_reward_vault: Box<Account<'info, TokenAccount>>,
 }
 
+/// Permissionless: fold $FIRMA that has arrived in the backstop pool's `firma_reward_vault`
+/// (from `StakeholderConfig.backstop_pool_bps` on funded-trader payouts) into `acc_firma`.
+/// Mirrors `SyncFirmaYield` exactly, one field over.
+#[derive(Accounts)]
+pub struct SyncBackstopFirmaYield<'info> {
+    #[account(mut, seeds = [b"backstop_pool", backstop_pool.firm.as_ref()], bump = backstop_pool.bump)]
+    pub backstop_pool: Box<Account<'info, BackstopPool>>,
+
+    #[account(address = backstop_pool.firma_reward_vault)]
+    pub firma_reward_vault: Box<Account<'info, TokenAccount>>,
+}
+
+/// Backfill accounts for `init_backstop_firma_reward_vault` — see that instruction's doc comment.
+#[derive(Accounts)]
+pub struct InitBackstopFirmaRewardVault<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    #[account(mut, seeds = [b"backstop_pool", firm_state.key().as_ref()], bump = backstop_pool.bump)]
+    pub backstop_pool: Box<Account<'info, BackstopPool>>,
+
+    #[account(
+        init,
+        payer = payer,
+        token::mint = firma_mint,
+        token::authority = backstop_pool,
+        seeds = [b"backstop_firma_reward", firm_state.key().as_ref()],
+        bump
+    )]
+    pub firma_reward_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
 #[derive(Accounts)]
 #[instruction(cycle: u32)]
 pub struct EnqueuePayout<'info> {
@@ -6122,6 +6229,19 @@ pub struct ProcessQueuedPayout<'info> {
     )]
     pub staking_vault: Box<Account<'info, TokenAccount>>,
 
+    // Stakeholder BACKSTOP-staking share (2026-07-27 rebalance) → the backstop pool's own $FIRMA
+    // reward vault, distinct from `staking_vault` above. Optional — unlike no-risk staking, a
+    // backstop pool is genuinely optional per firm; if absent, `sh.backstop` simply isn't paid out
+    // here and stays in the staging vault as part of the firm's own treasury reserve (same fallback
+    // `compute_fee_split`'s `premium_bps` uses when a firm has no backstop pool).
+    #[account(
+        mut,
+        seeds = [b"backstop_firma_reward", firm_state.key().as_ref()],
+        bump,
+        token::mint = firm_state.firma_mint,
+    )]
+    pub backstop_firma_reward_vault: Option<Box<Account<'info, TokenAccount>>>,
+
     // Platform SOL fee destination (0.5% curve fee). NOTE: bind to platform config later.
     /// V2-8: canonical platform config — binds `platform_sol` to the DP fee destination (M-4 pattern),
     /// so this leg can't be pointed at a caller-controlled account.
@@ -6335,6 +6455,15 @@ pub struct AdvanceFirstPayout<'info> {
         token::mint = firm_state.firma_mint,
     )]
     pub staking_vault: Box<Account<'info, TokenAccount>>,
+
+    // 2026-07-27 staking rebalance — see the identical field on `ProcessQueuedPayout`.
+    #[account(
+        mut,
+        seeds = [b"backstop_firma_reward", firm_state.key().as_ref()],
+        bump,
+        token::mint = firm_state.firma_mint,
+    )]
+    pub backstop_firma_reward_vault: Option<Box<Account<'info, TokenAccount>>>,
 
     #[account(seeds = [b"platform_config"], bump = platform_config.bump)]
     pub platform_config: Box<Account<'info, PlatformConfig>>,
@@ -6664,7 +6793,8 @@ impl<'info> GraduateFirm<'info> {
 // Accounts are Box'd to keep the BPF stack frame under 4 KB.
 // §24 v2: the owner-initiated close (InitiateClose / CloseFirm) is GONE — a solvent firm has no exit.
 // `FinalizeBankruptcy` winds down a firm that auto-bankrupted (drew ≥10% of the ULP): permissionless, no
-// timelock, no owner leg — the entire SOL residual (treasury + insurance + loss-back) → the Universal Pool.
+// timelock, no owner leg — the entire SOL residual (treasury + insurance) → the Universal Pool. (Loss-back
+// is no longer part of this sweep — 2026-07-27 staking rebalance made it a notional counter, not a vault.)
 #[derive(Accounts)]
 pub struct FinalizeBankruptcy<'info> {
     /// Permissionless cranker (pays gas only). Anyone may wind down a bankrupt firm.
@@ -6691,14 +6821,11 @@ pub struct FinalizeBankruptcy<'info> {
     #[account(mut, seeds = [b"universal_vault"], bump, token::mint = firm_state.sol_mint)]
     pub universal_vault: Box<Account<'info, TokenAccount>>,
 
-    #[account(mut, seeds = [b"loss_back_vault", firm_state.key().as_ref()], bump)]
-    pub loss_back_vault: Box<Account<'info, TokenAccount>>,
-
     pub token_program: Program<'info, Token>,
 }
 
-// `from_treasury`/`from_insurance`/`from_loss_back` name which vault a transfer draws FROM (domain
-// terminology), not Rust's `From` trait convention — clippy's naming heuristic doesn't know that.
+// `from_treasury`/`from_insurance` name which vault a transfer draws FROM (domain terminology),
+// not Rust's `From` trait convention — clippy's naming heuristic doesn't know that.
 #[allow(clippy::wrong_self_convention)]
 impl<'info> FinalizeBankruptcy<'info> {
     fn from_treasury(&self, to: AccountInfo<'info>, amount: u64) -> Result<()> {
@@ -6706,9 +6833,6 @@ impl<'info> FinalizeBankruptcy<'info> {
     }
     fn from_insurance(&self, to: AccountInfo<'info>, amount: u64) -> Result<()> {
         self.vault_xfer(self.insurance_vault.to_account_info(), to, amount)
-    }
-    fn from_loss_back(&self, to: AccountInfo<'info>, amount: u64) -> Result<()> {
-        self.vault_xfer(self.loss_back_vault.to_account_info(), to, amount)
     }
     /// Move tokens out of a firm-PDA-owned vault (firm PDA signs).
     fn vault_xfer(&self, from: AccountInfo<'info>, to: AccountInfo<'info>, amount: u64) -> Result<()> {
@@ -7429,6 +7553,17 @@ pub struct InitBackstopPool<'info> {
         bump
     )]
     pub premium_vault: Box<Account<'info, TokenAccount>>,
+    /// 2026-07-27 staking rebalance: the $FIRMA-denominated counterpart to `premium_vault`,
+    /// funded by `StakeholderConfig.backstop_pool_bps` on funded-trader payouts.
+    #[account(
+        init,
+        payer = payer,
+        token::mint = firma_mint,
+        token::authority = backstop_pool,
+        seeds = [b"backstop_firma_reward", firm_state.key().as_ref()],
+        bump
+    )]
+    pub firma_reward_vault: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -7529,6 +7664,9 @@ pub struct WithdrawBackstop<'info> {
     pub escrow_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, address = backstop_pool.premium_vault)]
     pub premium_vault: Box<Account<'info, TokenAccount>>,
+    /// 2026-07-27 staking rebalance — the $FIRMA yield leg, distinct from `escrow_vault` (principal).
+    #[account(mut, address = backstop_pool.firma_reward_vault)]
+    pub firma_reward_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -7552,6 +7690,11 @@ impl<'info> WithdrawBackstop<'info> {
     }
     fn pay_sol(&self, amount: u64) -> Result<()> {
         self.pay(self.premium_vault.to_account_info(), self.staker_sol.to_account_info(), amount)
+    }
+    /// 2026-07-27 staking rebalance: pays accrued $FIRMA YIELD (from `firma_reward_vault`) — not
+    /// to be confused with `pay_firma` above, which returns surviving PRINCIPAL from `escrow_vault`.
+    fn pay_firma_yield(&self, amount: u64) -> Result<()> {
+        self.pay(self.firma_reward_vault.to_account_info(), self.staker_firma.to_account_info(), amount)
     }
     fn pay(&self, from: AccountInfo<'info>, to: AccountInfo<'info>, amount: u64) -> Result<()> {
         if amount == 0 {
@@ -7596,6 +7739,15 @@ pub struct ClaimBackstopPremium<'info> {
         constraint = staker_sol.owner == staker.key() @ FirmError::Unauthorized,
     )]
     pub staker_sol: Box<Account<'info, TokenAccount>>,
+    /// 2026-07-27 staking rebalance — the $FIRMA counterpart to `premium_vault`/`staker_sol`.
+    #[account(mut, address = backstop_pool.firma_reward_vault)]
+    pub firma_reward_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = firm_state.firma_mint,
+        constraint = staker_firma.owner == staker.key() @ FirmError::Unauthorized,
+    )]
+    pub staker_firma: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -7613,6 +7765,26 @@ impl<'info> ClaimBackstopPremium<'info> {
                 anchor_spl::token::Transfer {
                     from: self.premium_vault.to_account_info(),
                     to: self.staker_sol.to_account_info(),
+                    authority: self.backstop_pool.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
+    }
+
+    fn pay_firma(&self, amount: u64) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let bump = [self.backstop_pool.bump];
+        let seeds = backstop_signer(&self.backstop_pool.firm, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.firma_reward_vault.to_account_info(),
+                    to: self.staker_firma.to_account_info(),
                     authority: self.backstop_pool.to_account_info(),
                 },
                 &[&seeds],
@@ -8425,89 +8597,8 @@ pub struct SetRiskEngineAuthority<'info> {
     pub firm_state: Box<Account<'info, FirmState>>,
 }
 
-#[derive(Accounts)]
-pub struct InitLossBackVault<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
-    pub firm_state: Box<Account<'info, FirmState>>,
-
-    #[account(address = firm_state.sol_mint)]
-    pub sol_mint: Box<Account<'info, Mint>>,
-
-    // PDA-owned SOL accumulator for the 3% loss-back leg. Authority = firm PDA, so the only exit is
-    // `redeem_loss_back_credit` (per-trader, balance- and stake-gated).
-    #[account(
-        init,
-        payer = payer,
-        token::mint = sol_mint,
-        token::authority = firm_state,
-        seeds = [b"loss_back_vault", firm_state.key().as_ref()],
-        bump
-    )]
-    pub loss_back_vault: Box<Account<'info, TokenAccount>>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct RedeemLossBackCredit<'info> {
-    #[account(mut)]
-    pub trader: Signer<'info>,
-
-    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
-    pub firm_state: Box<Account<'info, FirmState>>,
-
-    #[account(
-        mut,
-        seeds = [b"loss_back", firm_state.key().as_ref(), trader.key().as_ref()],
-        bump = loss_back_credit.bump,
-        constraint = loss_back_credit.trader == trader.key() @ FirmError::Unauthorized,
-    )]
-    pub loss_back_credit: Box<Account<'info, LossBackCredit>>,
-
-    #[account(mut, seeds = [b"loss_back_vault", firm_state.key().as_ref()], bump)]
-    pub loss_back_vault: Box<Account<'info, TokenAccount>>,
-
-    #[account(mut, token::mint = firm_state.sol_mint, token::authority = trader)]
-    pub trader_sol: Box<Account<'info, TokenAccount>>,
-
-    // The stake gate: bound to this trader+firm by its PDA seeds; redemption requires
-    // `amount_staked >= firm_state.loss_back_min_stake`. A trader who never staked has no such PDA.
-    #[account(
-        seeds = [b"staker", firm_state.key().as_ref(), trader.key().as_ref()],
-        bump = staker_position.bump,
-    )]
-    pub staker_position: Box<Account<'info, StakerPosition>>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-impl<'info> RedeemLossBackCredit<'info> {
-    /// Transfer redeemed SOL out of the firm-PDA-owned loss-back vault to the trader.
-    // Pre-existing dead code (unused before this pass too) — flagged, not deleted, since deleting
-    // requires confirming it's not meant for a near-future call site. Candidate for a real cleanup pass.
-    #[allow(dead_code)]
-    fn pay_trader(&self, amount: u64) -> Result<()> {
-        let bump = [self.firm_state.bump];
-        let seeds = firm_signer(&self.firm_state.owner, &bump);
-        token::transfer(
-            CpiContext::new_with_signer(
-                self.token_program.to_account_info(),
-                anchor_spl::token::Transfer {
-                    from: self.loss_back_vault.to_account_info(),
-                    to: self.trader_sol.to_account_info(),
-                    authority: self.firm_state.to_account_info(),
-                },
-                &[&seeds],
-            ),
-            amount,
-        )
-    }
-}
+// `InitLossBackVault` and `RedeemLossBackCredit` (+ its dead `pay_trader` helper) were REMOVED
+// 2026-07-27 — comeback credit no longer has a backing vault; see `pay_challenge_fee`.
 
 #[derive(Accounts)]
 pub struct InitPlatformRisk<'info> {
@@ -8732,17 +8823,26 @@ pub struct StakeholderConfig {
     /// Fraction of the stakeholder SOL notional routed to the Universal Treasury Pool
     /// before the curve buy (pre-buy SOL carve). 0 = disabled; max 6000 (60%).
     pub universal_sol_bps: u16,
+    /// 2026-07-27 staking rebalance: the backstop pool's $FIRMA yield leg — same FIRMA-basis
+    /// renormalization as `staking_pool_bps`, just a distinct destination (the backstop pool's
+    /// `firma_reward_vault` instead of the no-risk pool's). Halving `staking_pool_bps` and handing
+    /// the freed half to this field keeps the FIRMA basis sum unchanged.
+    pub backstop_pool_bps: u16,
 }
 
 impl Default for StakeholderConfig {
     fn default() -> Self {
-        // §19 defaults: 30% owner / 10% staking / 10% buyback+burn / 10% treasury / 40% universal SOL.
+        // §19 defaults, 2026-07-27 staking rebalance: 30% owner / 5% no-risk staking / 5% backstop
+        // staking (new; was 10% no-risk / 0% backstop) / 10% buyback+burn / 10% treasury / 40%
+        // universal SOL. FIRMA basis (10000 - universal_sol_bps = 6000) still sums correctly:
+        // 3000 + 500 + 500 + 1000 + 1000 = 6000.
         Self {
             owner_share_bps: 3000,
-            staking_pool_bps: 1000,
+            staking_pool_bps: 500,
             buyback_burn_bps: 1000,
             treasury_reserve_bps: 1000,
             universal_sol_bps: 4000,
+            backstop_pool_bps: 500,
         }
     }
 }
@@ -9056,11 +9156,12 @@ pub struct StakerPosition {
 }
 
 /// Per-trader loss-back "comeback" credit (flywheel). Seeds: ["loss_back", firm, trader]. Created
-/// lazily on the trader's first evaluation purchase. `balance` is the redeemable SOL accrued from
-/// the 3% loss-back leg of this trader's own fees; it can only be pulled out (toward a future eval)
-/// while the trader stakes at least `FirmState.loss_back_min_stake` $FIRMA. `lifetime_accrued` and
-/// `lifetime_redeemed` are monotonic public counters; `lifetime_accrued - lifetime_redeemed` is the
-/// trader's share of the firm `loss_back_vault` balance.
+/// lazily on the trader's first evaluation purchase. 2026-07-27 staking rebalance: `balance` is a
+/// PURELY NOTIONAL counter now — no backing vault, no token ever moves on accrual. It accrues 2%
+/// (`LOSS_BACK_BPS`) of what the trader actually pays on every purchase, and can only be applied
+/// as a price reduction on a LATER purchase (never cashed to wallet) while the trader stakes at
+/// least `FirmState.loss_back_min_stake` $FIRMA in EITHER the no-risk or the backstop pool — see
+/// `pay_challenge_fee`. `lifetime_accrued`/`lifetime_redeemed` are monotonic public counters.
 #[account]
 #[derive(InitSpace)]
 pub struct LossBackCredit {
@@ -9107,6 +9208,21 @@ pub struct BackstopPool {
     pub daily_withdrawn: u64,
     /// Unix day (`ts / 86_400`) that `daily_withdrawn` accrues against.
     pub withdraw_day: i64,
+    /// $FIRMA yield per staked token, scaled by PRECISION (2026-07-27 staking rebalance —
+    /// mirrors StakingPool's `acc_firma`). Funded by `StakeholderConfig.backstop_pool_bps` on
+    /// every funded-trader payout, folded in by the permissionless `sync_backstop_firma_yield`.
+    /// Divides by `total_premium_weight` (nominal), NOT `total_staked` — same reasoning as
+    /// `premium_acc`: a draw must not shrink the denominator other stakers' pending yield is
+    /// computed against, or `Σ firma_claimable` can exceed what was actually funded.
+    /// Appended field — same resize-and-zero-fill migration as `daily_withdrawn`/`withdraw_day`
+    /// above, via the existing `migrate_backstop_pool_fields` (it resizes to whatever
+    /// `BackstopPool::INIT_SPACE` currently is, so no new migration instruction is needed).
+    pub acc_firma: u128,
+    /// $FIRMA balance of `firma_reward_vault` already folded into `acc_firma`.
+    pub firma_reward_accounted: u64,
+    pub firma_reward_vault: Pubkey,
+    /// $FIRMA retained when nothing is staked; flushed on the next `sync_backstop_firma_yield`.
+    pub unallocated_firma: u64,
 }
 
 // ───────────────────────── Affiliate program (§17.1) ─────────────────────────
@@ -9442,6 +9558,9 @@ pub struct BackstopPosition {
     /// pre-existing `cooldown_ends_at` via `.max()`. Appended field — see
     /// `migrate_backstop_position_fields`.
     pub cooldown_requested_at: i64,
+    /// $FIRMA yield debt against `BackstopPool.acc_firma` (2026-07-27 staking rebalance).
+    /// Appended field — covered by the existing `migrate_backstop_position_fields` resize.
+    pub firma_debt: u128,
 }
 
 /// Per-dispute insurance-payout record (§7). Seeds: ["dispute_payout", dispute]. `amount` is the
@@ -9553,6 +9672,8 @@ pub struct BackstopWithdrawn {
     pub staker: Pubkey,
     pub surviving: u64,
     pub premium: u64,
+    /// 2026-07-27 staking rebalance.
+    pub firma_yield: u64,
 }
 
 #[event]
@@ -9560,6 +9681,14 @@ pub struct BackstopPremiumClaimed {
     pub firm: Pubkey,
     pub staker: Pubkey,
     pub premium: u64,
+}
+
+/// 2026-07-27 staking rebalance.
+#[event]
+pub struct BackstopFirmaYieldClaimed {
+    pub firm: Pubkey,
+    pub staker: Pubkey,
+    pub firma: u64,
 }
 
 #[event]
@@ -10559,14 +10688,15 @@ mod tests {
         assert_eq!(s.owner_vested, 17_955_000); // 4.5%
         assert_eq!(s.lp, 43_890_000); // 11%
         assert_eq!(s.backstop_premium, 0);
-        assert_eq!(s.normal_staking, 19_950_000); // 5%
+        assert_eq!(s.normal_staking, 11_970_000); // 3% (2026-07-27 staking rebalance: was 5%)
         assert_eq!(s.dprop_buyback, 3_990_000); // 1%
         assert_eq!(s.firma_buyback, 3_990_000); // 1%
-        assert_eq!(s.loss_back, 7_980_000); // 2%
+        // loss_back is no longer a FeeSplit leg (2026-07-27) — it's a notional accrual computed
+        // directly in pay_challenge_fee, not part of compute_fee_split's output.
         assert_eq!(s.affiliate_pool, 35_910_000); // 9% (AFFILIATE_DEFAULT_BPS - 100)
         assert_eq!(s.dprop_staking, 39_900_000); // 10%
         assert_eq!(s.universal, 3_990_000); // 1.0% (trimmed from 1.5%)
-        assert_eq!(s.treasury_gross, 155_610_000); // 39.0% (38.0% nominal +1% affiliate redirect; +0.5% from the universal trim)
+        assert_eq!(s.treasury_gross, 171_570_000); // was 155_610_000 pre-rebalance; +2% ex-normal_staking, +2% ex-loss_back
     }
 
     #[test]
@@ -10583,8 +10713,8 @@ mod tests {
 
     #[test]
     fn fee_split_backstop_premium_carved_from_treasury() {
-        // Same example with the fixed 6% backstop premium active: premium is carved from the
-        // treasury slice, every other leg is unchanged.
+        // Same example with the fixed 8% backstop premium active (2026-07-27 staking rebalance,
+        // was 6%): premium is carved from the treasury slice, every other leg is unchanged.
         let base = compute_fee_split(
             399_000_000,
             owner_bps_for_tier(2),
@@ -10599,15 +10729,14 @@ mod tests {
             DEFAULT_BACKSTOP_PREMIUM_BPS,
             AFFILIATE_DEFAULT_BPS,
         );
-        assert_eq!(s.backstop_premium, 23_940_000); // 6% of $399
-        assert_eq!(s.treasury_gross, base.treasury_gross - 23_940_000); // carved from treasury
+        assert_eq!(s.backstop_premium, 31_920_000); // 8% of $399
+        assert_eq!(s.treasury_gross, base.treasury_gross - 31_920_000); // carved from treasury
         assert_eq!(s.dp_profit, base.dp_profit); // other legs untouched
         assert_eq!(s.insurance, base.insurance);
         assert_eq!(s.lp, base.lp);
         assert_eq!(s.normal_staking, base.normal_staking);
         assert_eq!(s.dprop_buyback, base.dprop_buyback);
         assert_eq!(s.firma_buyback, base.firma_buyback);
-        assert_eq!(s.loss_back, base.loss_back);
         assert_eq!(s.affiliate_pool, base.affiliate_pool);
         assert_eq!(s.dprop_staking, base.dprop_staking);
     }
@@ -10696,7 +10825,6 @@ mod tests {
             + s.normal_staking
             + s.dprop_buyback
             + s.firma_buyback
-            + s.loss_back
             + s.affiliate_pool
             + s.dprop_staking
             + s.universal
@@ -10704,17 +10832,9 @@ mod tests {
         assert_eq!(sum, amount);
     }
 
-    #[test]
-    fn fee_split_carves_loss_back_from_treasury() {
-        // Loss-back is a fixed 2% leg carved from the treasury slice: enabling it leaves every other
-        // leg untouched and drops the treasury remainder by exactly 2% of the fee.
-        let amount = 399_000_000;
-        let s = compute_fee_split(amount, owner_bps_for_tier(2), lp_bps_for_depth(0), 0, 0);
-        assert_eq!(s.loss_back, 7_980_000); // 2% of $399
-        // The treasury remainder already reflects the carve (the dedicated worked example asserts the
-        // exact figure); here we lock the rate and the no-overshoot invariant.
-        assert_eq!(s.loss_back, bps(amount, LOSS_BACK_BPS));
-    }
+    // fee_split_carves_loss_back_from_treasury REMOVED 2026-07-27 — loss-back is no longer a
+    // FeeSplit leg at all (it's a notional accrual computed directly in pay_challenge_fee), so
+    // there's nothing left in compute_fee_split's output for this test to assert.
 
     #[test]
     fn payout_tier_split_matches_doc_table() {
@@ -10745,21 +10865,24 @@ mod tests {
 
     #[test]
     fn stakeholder_split_defaults_and_sums() {
-        // Default config: 30% owner / 10% staking / 10% burn / 10% treasury / 40% universal SOL.
-        // `split_stakeholder` is called with the $FIRMA amount AFTER the 40% SOL carve, i.e.
-        // 60% of the original stakeholder notional. Renormalized by firma_basis=6000:
-        //   owner   = amount * 3000/6000 = 50% of amount = 30% of original ✓
-        //   staking = amount * 1000/6000 ≈ 16.7%           = 10% of original ✓
-        //   burn    = amount * 1000/6000 ≈ 16.7%
-        //   treasury = remainder         ≈ 16.7%
+        // Default config, 2026-07-27 staking rebalance: 30% owner / 5% no-risk staking / 5% backstop
+        // staking / 10% burn / 10% treasury / 40% universal SOL. `split_stakeholder` is called with
+        // the $FIRMA amount AFTER the 40% SOL carve, i.e. 60% of the original stakeholder notional.
+        // Renormalized by firma_basis=6000:
+        //   owner    = amount * 3000/6000 = 50% of amount = 30% of original ✓
+        //   staking  = amount * 500/6000  ≈ 8.3%            = 5% of original ✓
+        //   backstop = amount * 500/6000  ≈ 8.3%            = 5% of original (new leg)
+        //   burn     = amount * 1000/6000 ≈ 16.7%
+        //   treasury = remainder          ≈ 16.7%
         let cfg = StakeholderConfig::default();
         let amount = 6_000_000u64; // represents the 60% $FIRMA residual
         let s = split_stakeholder(amount, &cfg);
         assert_eq!(s.owner, 3_000_000); // 50% of 6M
-        assert_eq!(s.staking, 1_000_000); // 1000/6000 * 6M
+        assert_eq!(s.staking, 500_000); // 500/6000 * 6M
+        assert_eq!(s.backstop, 500_000); // 500/6000 * 6M
         assert_eq!(s.buyback_burn, 1_000_000);
         assert_eq!(s.treasury_reserve, 1_000_000); // remainder
-        assert_eq!(s.owner + s.staking + s.buyback_burn + s.treasury_reserve, amount);
+        assert_eq!(s.owner + s.staking + s.backstop + s.buyback_burn + s.treasury_reserve, amount);
     }
 
     #[test]
@@ -10767,15 +10890,18 @@ mod tests {
         let cfg = StakeholderConfig::default();
         let amount = 6_000_001u64; // odd → reserve takes the remainder
         let s = split_stakeholder(amount, &cfg);
-        assert_eq!(s.owner + s.staking + s.buyback_burn + s.treasury_reserve, amount);
+        assert_eq!(s.owner + s.staking + s.backstop + s.buyback_burn + s.treasury_reserve, amount);
     }
 
     #[test]
     fn stakeholder_split_zero_universal_uses_raw_bps() {
         // When universal_sol_bps = 0, firma_basis = 10000 and raw bps apply directly.
+        // backstop_pool_bps = 0 here — this fixture predates the 2026-07-27 backstop leg and isn't
+        // testing it; kept at 0 so the other four legs' expected values stay exactly as before.
         let cfg = StakeholderConfig {
             owner_share_bps: 5000,
             staking_pool_bps: 2000,
+            backstop_pool_bps: 0,
             buyback_burn_bps: 1500,
             treasury_reserve_bps: 1500,
             universal_sol_bps: 0,
@@ -10783,9 +10909,10 @@ mod tests {
         let s = split_stakeholder(10_000_000, &cfg);
         assert_eq!(s.owner, 5_000_000);
         assert_eq!(s.staking, 2_000_000);
+        assert_eq!(s.backstop, 0);
         assert_eq!(s.buyback_burn, 1_500_000);
         assert_eq!(s.treasury_reserve, 1_500_000);
-        assert_eq!(s.owner + s.staking + s.buyback_burn + s.treasury_reserve, 10_000_000);
+        assert_eq!(s.owner + s.staking + s.backstop + s.buyback_burn + s.treasury_reserve, 10_000_000);
     }
 
     #[test]
@@ -11020,8 +11147,9 @@ mod tests {
     #[test]
     fn eval_fee_split_conserves_exactly() {
         // Every eval fee funds the shared pools (universal 1.5%, $DPROP staking, buyback sinks, insurance)
-        // + the firm treasury. CONSERVATION: no base unit may be created or destroyed — the 15 legs must
-        // sum to EXACTLY `amount`. `treasury_gross` is the residual (`amount − others`), so conservation
+        // + the firm treasury. CONSERVATION: no base unit may be created or destroyed — the 14 legs must
+        // sum to EXACTLY `amount` (2026-07-27: loss_back removed, no longer a FeeSplit leg). `treasury_gross`
+        // is the residual (`amount − others`), so conservation
         // holds iff `others <= amount`; the property test sweeps random amounts + configurable bps and
         // asserts exact conservation on the whole valid space (and that saturation is the only failure mode).
         for seed in 0..60_000u64 {
@@ -11049,7 +11177,6 @@ mod tests {
                 + s.normal_staking
                 + s.dprop_buyback
                 + s.firma_buyback
-                + s.loss_back
                 + s.affiliate_pool
                 + s.dprop_staking
                 + s.universal
@@ -11167,7 +11294,6 @@ mod tests {
             assert_eq!(adjusted.normal_staking, base.normal_staking, "seed {seed}");
             assert_eq!(adjusted.dprop_buyback, base.dprop_buyback, "seed {seed}");
             assert_eq!(adjusted.firma_buyback, base.firma_buyback, "seed {seed}");
-            assert_eq!(adjusted.loss_back, base.loss_back, "seed {seed}");
             assert_eq!(adjusted.affiliate_pool, base.affiliate_pool, "seed {seed}");
             assert_eq!(adjusted.dprop_staking, base.dprop_staking, "seed {seed}");
             assert_eq!(adjusted.universal, base.universal, "seed {seed}");
@@ -11178,8 +11304,8 @@ mod tests {
     #[test]
     fn treasury_health_adjustment_conserves_exactly() {
         // The health adjustment only ever moves value BETWEEN fields of an already-conserving
-        // FeeSplit — it can neither create nor destroy base units. Prove the wrapped 15-field sum
-        // always equals the unwrapped 15-field sum, for the same (amount, owner_bps, lp_bps,
+        // FeeSplit — it can neither create nor destroy base units. Prove the wrapped 14-field sum
+        // always equals the unwrapped 14-field sum, for the same (amount, owner_bps, lp_bps,
         // premium_bps, affiliate_bps), across every tier and a treasury_sol range spanning all 5
         // zones (0..20,000 SOL) — including the over-redirect branch (see
         // `treasury_health_adjustment_saturates_when_overconfigured` for a deterministic pin of that
@@ -11211,7 +11337,6 @@ mod tests {
                 + base.normal_staking
                 + base.dprop_buyback
                 + base.firma_buyback
-                + base.loss_back
                 + base.affiliate_pool
                 + base.dprop_staking
                 + base.universal
@@ -11229,7 +11354,6 @@ mod tests {
                 + adjusted.normal_staking
                 + adjusted.dprop_buyback
                 + adjusted.firma_buyback
-                + adjusted.loss_back
                 + adjusted.affiliate_pool
                 + adjusted.dprop_staking
                 + adjusted.universal
@@ -11244,19 +11368,24 @@ mod tests {
 
     #[test]
     fn treasury_health_adjustment_saturates_when_overconfigured() {
-        // Enterprise, Saturated zone, shallow curve (lp 11%), active backstop (6%), referred purchase
-        // (9% effective affiliate) — others = 72% of the fee, leaving only 28% pre-boost treasury,
-        // while the nominal boost at Saturated is 30% of the fee. Must degrade safely: no panic,
-        // sum == amount, treasury_gross == 0, and the credited legs must be visibly SCALED DOWN below
-        // their nominal deltas, not independently clamped (independent clamping would break
-        // conservation — see the correctness note on `apply_treasury_health_adjustment`).
+        // Enterprise, Saturated zone, shallow curve (lp 11%), active backstop (8%, 2026-07-27
+        // rebalance — was 6%), a stress-test 15% affiliate rate (real production locks the referral
+        // rate to AFFILIATE_DEFAULT_BPS=10%; this pure-math fixture intentionally goes higher, same
+        // as the general conservation fuzz above, purely to reconstruct genuine over-redirect —
+        // 2026-07-27's lower normal_staking/no-loss_back-carve raised the pre-boost treasury baseline
+        // enough that the OLD 10%-affiliate fixture no longer over-redirects at all) — leaves only a
+        // small pre-boost treasury share (asserted below via `base.treasury_gross > 0`), while the
+        // nominal boost at Saturated is 30% of the fee. Must degrade safely: no panic, sum == amount,
+        // treasury_gross == 0, and the credited legs must be visibly SCALED DOWN below their nominal
+        // deltas, not independently clamped (independent clamping would break conservation — see the
+        // correctness note on `apply_treasury_health_adjustment`).
         let amount = 1_000_000_000u64;
         let tier = 4u8; // Enterprise
         let treasury_sol = treasury_health_thresholds_lamports(tier)[3]; // exactly at Saturated
         let owner_bps = owner_bps_for_tier(tier);
         let lp_bps = 1100u16; // shallow curve, 11%
-        let premium_bps = DEFAULT_BACKSTOP_PREMIUM_BPS; // 6%, backstop active
-        let affiliate_bps = AFFILIATE_DEFAULT_BPS; // referred, 9% effective after the -100bps redirect
+        let premium_bps = DEFAULT_BACKSTOP_PREMIUM_BPS; // 8%, backstop active
+        let affiliate_bps = 1500u16; // stress-test rate — see comment above
 
         let base = compute_fee_split(amount, owner_bps, lp_bps, premium_bps, affiliate_bps);
         assert!(base.treasury_gross > 0, "test fixture should leave SOME pre-boost treasury");
@@ -11288,7 +11417,6 @@ mod tests {
             + adjusted.normal_staking
             + adjusted.dprop_buyback
             + adjusted.firma_buyback
-            + adjusted.loss_back
             + adjusted.affiliate_pool
             + adjusted.dprop_staking
             + adjusted.universal
@@ -11299,9 +11427,10 @@ mod tests {
     #[test]
     fn treasury_health_matches_doc_example() {
         // §3.6 worked example: Pro tier, LP 5% (deep curve), no backstop, a referred purchase
-        // (AFFILIATE_DEFAULT_BPS) — the reference configuration MASTER_ECONOMICS §3.6 quotes (treasury
-        // 45.0% Growing -> 10.0% exactly at Saturated). amount = 1_000_000_000 divides every bps
-        // computation below with zero truncation, so these are exact, not approximate.
+        // (AFFILIATE_DEFAULT_BPS). 2026-07-27 staking rebalance shifted every figure below by +4.0pp
+        // (normal_staking 5%->3%, loss_back's 2% carve removed entirely) — update MASTER_ECONOMICS.md
+        // §3.6 to match (was 45.0% Growing -> 10.0% Saturated; now 49.0% -> 14.0%). amount =
+        // 1_000_000_000 divides every bps computation below with zero truncation, so these are exact.
         let amount = 1_000_000_000u64;
         let tier = 2u8; // Pro
         let owner_bps = owner_bps_for_tier(tier);
@@ -11315,7 +11444,7 @@ mod tests {
             tier,
             0, // Growing zone
         );
-        assert_eq!(growing.treasury_gross, 450_000_000); // 45.0%
+        assert_eq!(growing.treasury_gross, 490_000_000); // 49.0% (was 45.0% pre-rebalance)
 
         let healthy_threshold = treasury_health_thresholds_lamports(tier)[0];
         let healthy = apply_treasury_health_adjustment(
@@ -11324,7 +11453,7 @@ mod tests {
             tier,
             healthy_threshold,
         );
-        assert_eq!(healthy.treasury_gross, 362_600_000); // 36.26%
+        assert_eq!(healthy.treasury_gross, 402_600_000); // 40.26% (was 36.26% pre-rebalance)
 
         let saturated_threshold = treasury_health_thresholds_lamports(tier)[3];
         let saturated = apply_treasury_health_adjustment(
@@ -11333,7 +11462,10 @@ mod tests {
             tier,
             saturated_threshold,
         );
-        assert_eq!(saturated.treasury_gross, 100_000_000); // 10.0% exactly, in this reference config
+        assert_eq!(saturated.treasury_gross, 140_000_000); // 14.0% (was 10.0% pre-rebalance)
+        // The four boost-credited lines below are UNCHANGED by the rebalance — the boost formula
+        // doesn't depend on normal_staking/loss_back at all, only the pre-boost treasury baseline
+        // (and post-boost treasury) shifted.
         assert_eq!(saturated.owner_immediate + saturated.owner_vested, 160_000_000); // 16.0%
         assert_eq!(saturated.dp_profit + saturated.dp_treasury, 170_000_000); // 17.0%
         assert_eq!(saturated.dprop_buyback + saturated.firma_buyback, 90_000_000); // 9.0% (Buybacks)
@@ -11630,18 +11762,23 @@ mod tests {
     #[test]
     fn stakeholder_config_validation() {
         assert!(validate_stakeholder_config(&StakeholderConfig::default()));
-        // Sum != 10000 (universal_sol one short).
+        // Sum != 10000 (universal_sol one short). backstop_pool_bps: 0 is itself out of its own
+        // (500..=3000) bound, but that's moot — the sum check alone already fails this.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 3000,
             staking_pool_bps: 1000,
+            backstop_pool_bps: 0,
             buyback_burn_bps: 1000,
             treasury_reserve_bps: 1000,
             universal_sol_bps: 3999, // sum = 9999
         }));
         // buyback_burn below the 3% (300 bps) floor (cannot zero the deflationary mechanism).
+        // staking/backstop split the old 1000 in half (500 each) so the sum stays isolated to this
+        // one violation.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 3000,
-            staking_pool_bps: 1000,
+            staking_pool_bps: 500,
+            backstop_pool_bps: 500,
             buyback_burn_bps: 200, // below 300
             treasury_reserve_bps: 1000,
             universal_sol_bps: 4800, // sum = 10000
@@ -11650,22 +11787,26 @@ mod tests {
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 5001, // above 5000
             staking_pool_bps: 500,
+            backstop_pool_bps: 500,
             buyback_burn_bps: 300,
             treasury_reserve_bps: 0,
-            universal_sol_bps: 4199, // sum = 10000
+            universal_sol_bps: 3699, // sum = 10000
         }));
         // universal_sol above 60% (6000 bps) ceiling.
         assert!(!validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 1000,
             staking_pool_bps: 500,
+            backstop_pool_bps: 500,
             buyback_burn_bps: 300,
             treasury_reserve_bps: 200,
-            universal_sol_bps: 8000, // above 6000; sum = 10000
+            universal_sol_bps: 7500, // above 6000; sum = 10000
         }));
-        // Minimum valid: operator-centric with universal disabled.
+        // Minimum valid: operator-centric with universal disabled. staking/backstop split the old
+        // 3000 ceiling in half (1500 each) so both stay within their own (500..=3000) bound.
         assert!(validate_stakeholder_config(&StakeholderConfig {
             owner_share_bps: 5000,
-            staking_pool_bps: 3000,
+            staking_pool_bps: 1500,
+            backstop_pool_bps: 1500,
             buyback_burn_bps: 2000,
             treasury_reserve_bps: 0,
             universal_sol_bps: 0,
@@ -11893,3 +12034,4 @@ mod tests {
         }
     }
 }
+
