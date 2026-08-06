@@ -1999,6 +1999,205 @@ pub mod firm {
         Ok(())
     }
 
+    // ───────────── Prediction Market LP Pool (Phase 2 pooled-LP AMM plan) ─────────────
+    // A near-exact structural mirror of the Investor Backstop Pool immediately above — same PDA/vault
+    // pattern, same PRECISION-scaled accumulator math, same whale-tiered cooldown, same rolling
+    // daily-outflow cap — for a different destination: Phase 3 will add per-market on-chain curves
+    // this pool's capital gets algorithmically allocated across. See `PredictionMarketLpPool`'s doc
+    // comment for the full field-by-field mapping to `BackstopPool`.
+
+    /// Initialise a firm's shared Prediction Market LP Pool — the $FIRMA escrow vault (idle pool
+    /// capital) + the $FIRMA yield vault (accrued trading-fee yield, swept in from curves by Phase
+    /// 3's `sweep_curve_fees_to_pool`). Permissioned identically to `init_backstop_pool`: any payer
+    /// may stand up the pool (the PDA seeds already bind it 1:1 to the firm, so this is init-once,
+    /// not an authority decision).
+    pub fn init_pm_lp_pool(ctx: Context<InitPmLpPool>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let pool = &mut ctx.accounts.pm_lp_pool;
+        pool.firm = ctx.accounts.firm_state.key();
+        pool.total_staked = 0;
+        pool.total_yield_weight = 0;
+        pool.yield_acc = 0;
+        pool.loss_acc = 0;
+        pool.unallocated_yield = 0;
+        pool.escrow_vault = ctx.accounts.escrow_vault.key();
+        pool.yield_vault = ctx.accounts.yield_vault.key();
+        pool.total_drawn = 0;
+        pool.total_returned = 0;
+        pool.last_yield_at = now;
+        pool.daily_withdrawn = 0;
+        pool.withdraw_day = 0;
+        pool.allocation_cap_bps = DEFAULT_PM_LP_ALLOCATION_CAP_BPS;
+        pool.bump = ctx.bumps.pm_lp_pool;
+        Ok(())
+    }
+
+    /// Stake $FIRMA into the shared Prediction Market LP Pool. Escrows the tokens (at risk once
+    /// Phase 3 allocates them into curves) and adjusts the position's yield + loss debt so the new
+    /// principal earns no past yield and absorbs no past loss — same discipline as `stake_backstop`.
+    /// Cannot stake while a withdrawal cooldown is pending.
+    ///
+    /// Deliberately NO identity/self-check of any kind — unlike Phase 3's `add_curve_topup`, which
+    /// WILL reject `depositor.key() == curve.trader`. This pool is shared and algorithmically
+    /// diversified across every eligible trader's market; a trader routing their own skin-in-the-game
+    /// through the pool (rather than funding their own market's curve directly, which stays banned
+    /// everywhere else) IS the intended path, not a loophole to close.
+    pub fn stake_pm_lp(ctx: Context<StakePmLp>, amount: u64) -> Result<()> {
+        require!(amount > 0, FirmError::ZeroAmount);
+        require!(ctx.accounts.position.cooldown_ends_at == 0, FirmError::PmLpCooldownActive);
+        let now = Clock::get()?.unix_timestamp;
+        ctx.accounts.escrow(amount)?;
+
+        let pool = &mut ctx.accounts.pm_lp_pool;
+        pool.total_staked = pool.total_staked.checked_add(amount).ok_or(FirmError::MathOverflow)?;
+        pool.total_yield_weight =
+            pool.total_yield_weight.checked_add(amount).ok_or(FirmError::MathOverflow)?;
+        let yield_acc = pool.yield_acc;
+        let loss_acc = pool.loss_acc;
+
+        let pos = &mut ctx.accounts.position;
+        if pos.staker == Pubkey::default() {
+            pos.staker = ctx.accounts.staker.key();
+            pos.firm = ctx.accounts.firm_state.key();
+            pos.staked_at = now;
+            pos.bump = ctx.bumps.position;
+        }
+        pos.amount_staked = pos.amount_staked.checked_add(amount).ok_or(FirmError::MathOverflow)?;
+        pos.yield_debt = pos.yield_debt.saturating_add(yield_debt(amount, yield_acc));
+        pos.loss_debt = pos.loss_debt.saturating_add(yield_debt(amount, loss_acc));
+        emit!(PmLpStaked { firm: pos.firm, staker: pos.staker, amount });
+        Ok(())
+    }
+
+    /// Begin the withdrawal of a PM LP position. Starts an ARE-scaled cooldown (HEALTHY 3d …
+    /// CRITICAL 30d, by **effective** tier at request time) further scaled by a whale multiplier
+    /// (1.0x–3.0x by this position's current share of the pool) — mirrors
+    /// `request_unstake_backstop` exactly, via the duplicated `pm_lp_*` helpers (see their doc
+    /// comments for why they're duplicated rather than shared). The principal stays escrowed — still
+    /// earning yield and still slashable by a curve-side loss — until `withdraw_pm_lp` after the
+    /// cooldown, which independently rechecks both inputs and only ever extends the wait.
+    pub fn request_unstake_pm_lp(ctx: Context<RequestUnstakePmLp>) -> Result<()> {
+        require!(ctx.accounts.position.amount_staked > 0, FirmError::PmLpNothingStaked);
+        require!(ctx.accounts.position.cooldown_ends_at == 0, FirmError::PmLpCooldownActive);
+        let now = Clock::get()?.unix_timestamp;
+        let eff = effective_tier(ctx.accounts.firm_state.risk_tier as u8, &ctx.accounts.platform_risk);
+        let share_bps =
+            pm_lp_share_bps(ctx.accounts.position.amount_staked, ctx.accounts.pm_lp_pool.total_staked);
+        let cooldown = required_pm_lp_cooldown(eff, share_bps);
+        let pos = &mut ctx.accounts.position;
+        pos.cooldown_requested_at = now;
+        pos.cooldown_ends_at = now.checked_add(cooldown).ok_or(FirmError::MathOverflow)?;
+        emit!(PmLpUnstakeRequested {
+            firm: pos.firm,
+            staker: pos.staker,
+            unlocks_at: pos.cooldown_ends_at,
+        });
+        Ok(())
+    }
+
+    /// Withdraw up to `amount` (nominal $FIRMA) of a matured PM LP position: pays out the
+    /// proportional surviving principal and accrued yield for the slice withdrawn, gated on (1) no
+    /// active velocity-break (the same circuit breaker `withdraw_backstop` gates on — reused, not
+    /// duplicated, since it's a single firm-wide flag), (2) the cooldown — rechecked against the
+    /// CURRENT tier/whale-share, not just the value stored at request time — and (3) a rolling daily
+    /// pool-outflow cap. Mirrors `withdraw_backstop` line-by-line, including its partial-withdrawal
+    /// debt-scaling discipline: a partial withdrawal scales the remainder's debt DOWN
+    /// PROPORTIONALLY from its existing value (never reset to the live accumulator — that's only
+    /// valid for a genuinely fresh deposit, as `stake_pm_lp` does; resetting here would zero the
+    /// remainder's already-accrued, not-yet-realized loss/yield share and let a staker dodge it just
+    /// by withdrawing in slices) and leaves it in cooldown so the staker can keep draining across
+    /// windows instead of being blocked outright by the daily cap.
+    pub fn withdraw_pm_lp(ctx: Context<WithdrawPmLp>, amount: u64) -> Result<()> {
+        require!(amount > 0, FirmError::ZeroAmount);
+        require!(!ctx.accounts.firm_state.velocity_break_flag, FirmError::PmLpVelocityBreakActive);
+        let now = Clock::get()?.unix_timestamp;
+        let pos_ro = &ctx.accounts.position;
+        require!(pos_ro.cooldown_ends_at != 0, FirmError::PmLpNoCooldownRequested);
+
+        let eff_now = effective_tier(ctx.accounts.firm_state.risk_tier as u8, &ctx.accounts.platform_risk);
+        let share_bps_now = pm_lp_share_bps(pos_ro.amount_staked, ctx.accounts.pm_lp_pool.total_staked);
+        let required_cooldown_now = required_pm_lp_cooldown(eff_now, share_bps_now);
+        let required_unlock_now = pos_ro
+            .cooldown_requested_at
+            .checked_add(required_cooldown_now)
+            .ok_or(FirmError::MathOverflow)?;
+        require!(
+            now >= pos_ro.cooldown_ends_at.max(required_unlock_now),
+            FirmError::PmLpCooldownNotElapsed
+        );
+        require!(amount <= pos_ro.amount_staked, FirmError::InsufficientStake);
+
+        let pool = &ctx.accounts.pm_lp_pool;
+        let staked = pos_ro.amount_staked;
+        let original_loss_debt = pos_ro.loss_debt;
+        let original_yield_debt = pos_ro.yield_debt;
+        let pending_loss_total = pending_yield(staked, pool.loss_acc, original_loss_debt);
+        let surviving_total = staked.saturating_sub(pending_loss_total);
+        let yield_total = pending_yield(staked, pool.yield_acc, original_yield_debt);
+        let surviving_slice = ((amount as u128).saturating_mul(surviving_total as u128) / staked as u128) as u64;
+        let yield_slice = ((amount as u128).saturating_mul(yield_total as u128) / staked as u128) as u64;
+
+        // Anti-bank-run redemption gate: cap cumulative surviving-$FIRMA paid out per UTC day,
+        // recomputed fresh off the live pool each call — same reset-then-check idiom as
+        // `withdraw_backstop`. Exceeding it simply reverts — no queue — the staker retries with a
+        // smaller `amount` or waits for the next window.
+        let pool = &mut ctx.accounts.pm_lp_pool;
+        let day = now / 86_400;
+        if day != pool.withdraw_day {
+            pool.daily_withdrawn = 0;
+            pool.withdraw_day = day;
+        }
+        let cap = (pool.total_staked as u128 * PM_LP_DAILY_OUTFLOW_CAP_BPS as u128 / 10_000) as u64;
+        require!(
+            pool.daily_withdrawn.saturating_add(surviving_slice) <= cap,
+            FirmError::PmLpDailyCapExceeded
+        );
+        pool.daily_withdrawn = pool.daily_withdrawn.saturating_add(surviving_slice);
+
+        ctx.accounts.pay_principal(surviving_slice)?;
+        ctx.accounts.pay_yield(yield_slice)?;
+
+        let pool = &mut ctx.accounts.pm_lp_pool;
+        pool.total_staked = pool.total_staked.saturating_sub(surviving_slice);
+        pool.total_yield_weight = pool.total_yield_weight.saturating_sub(amount);
+
+        let remainder = staked.saturating_sub(amount);
+        let pos = &mut ctx.accounts.position;
+        pos.amount_staked = remainder;
+        if remainder == 0 {
+            pos.yield_debt = 0;
+            pos.loss_debt = 0;
+            pos.cooldown_ends_at = 0;
+            pos.cooldown_requested_at = 0;
+        } else {
+            // Scale the EXISTING debt down proportionally to the remaining share — do NOT reset to
+            // the live accumulator (see the doc comment above for why).
+            pos.yield_debt = original_yield_debt.saturating_mul(remainder as u128) / staked as u128;
+            pos.loss_debt = original_loss_debt.saturating_mul(remainder as u128) / staked as u128;
+        }
+        emit!(PmLpWithdrawn {
+            firm: pos.firm,
+            staker: pos.staker,
+            surviving: surviving_slice,
+            yield_paid: yield_slice,
+        });
+        Ok(())
+    }
+
+    /// Claim accrued yield without unstaking. Resets the yield debt to the live accumulator.
+    /// Mirrors `claim_backstop_premium`.
+    pub fn claim_pm_lp_yield(ctx: Context<ClaimPmLpYield>) -> Result<()> {
+        let staked = ctx.accounts.position.amount_staked;
+        let pending =
+            pending_yield(staked, ctx.accounts.pm_lp_pool.yield_acc, ctx.accounts.position.yield_debt);
+        ctx.accounts.pay_yield(pending)?;
+        let yield_acc = ctx.accounts.pm_lp_pool.yield_acc;
+        let pos = &mut ctx.accounts.position;
+        pos.yield_debt = yield_debt(staked, yield_acc);
+        emit!(PmLpYieldClaimed { firm: pos.firm, staker: pos.staker, yield_paid: pending });
+        Ok(())
+    }
+
     /// Deliver owed `$FIRMA` directly from the firm's **Tier-2 treasury reserve** (§22). When
     /// the SOL treasury can't fund a curve buy, the keeper draws the firm's pre-acquired
     /// `$FIRMA` (seeded at deployment) straight to the trader — no curve sale, no slippage —
@@ -3935,6 +4134,19 @@ pub const LOSS_BACK_MIN_STAKE: u64 = 1_000_000_000_000;
 /// now, so this is no longer a reachable bound (== the fixed rate).
 pub const MAX_BACKSTOP_PREMIUM_BPS: u16 = 600; // 6%
 
+// Prediction Market LP Pool (Phase 2 of the pooled-LP AMM plan) — a near-exact mirror of the
+// Investor Backstop Pool immediately above, for a different destination (Phase 3's per-market
+// curves). See `PredictionMarketLpPool`'s doc comment for the full structural mapping.
+/// Default `PredictionMarketLpPool.allocation_cap_bps` — the maximum share of `total_staked` the
+/// keeper may have deployed across every eligible market's curve at once (Phase 3's
+/// `allocate_pool_to_curve`/`deallocate_pool_from_curve`). Not enforced by any Phase 2 instruction;
+/// reserved here so the field has a sane default the moment the pool exists.
+pub const DEFAULT_PM_LP_ALLOCATION_CAP_BPS: u16 = 8000; // 80%
+/// Same anti-bank-run idiom as `BACKSTOP_DAILY_OUTFLOW_CAP_BPS`, own constant so the two pools' caps
+/// can move independently: the maximum share of the LIVE PM LP pool's `total_staked` (recomputed
+/// fresh each call) that `withdraw_pm_lp` may pay out across all stakers combined per rolling UTC day.
+pub const PM_LP_DAILY_OUTFLOW_CAP_BPS: u16 = 1000; // 10%
+
 // Dynamic LP thresholds on the REAL pool reserve, now in **lamports** (wSOL, 9 dp) — the curve reserve
 // is wSOL post-migration (§17). SOL MIGRATION (oracle-free, Phase 3+4): dimensionally lamports vs the
 // lamport reserve. Raw values kept as placeholders; the SOL-native magnitudes are a Phase-6 tunable.
@@ -4732,6 +4944,55 @@ fn backstop_whale_multiplier_tenths(share_bps: u64) -> u64 {
 /// risk or share rises while pending, never a shorter one.
 fn required_backstop_cooldown(effective_tier: u8, share_bps: u64) -> i64 {
     backstop_cooldown(effective_tier).saturating_mul(backstop_whale_multiplier_tenths(share_bps) as i64) / 10
+}
+
+/// PM-LP-pool PDA signer seeds (authority over the escrow + yield vaults). Mirrors `backstop_signer`.
+fn pm_lp_signer<'a>(firm: &'a Pubkey, bump: &'a [u8; 1]) -> [&'a [u8]; 3] {
+    [b"pm_lp_pool", firm.as_ref(), bump]
+}
+
+/// ARE-scaled PM LP unbonding cooldown — identical ladder to `backstop_cooldown` (HEALTHY 3d …
+/// CRITICAL 30d). Duplicated rather than shared: neither `backstop_cooldown` nor the three helpers
+/// below it are generic over which pool they're gating, and refactoring them into a shared helper
+/// is a riskier touch to `BackstopPool`'s already-devnet-proven withdraw path than paying for a
+/// few duplicated lines here (per the plan's explicit instruction to prefer duplication this pass).
+fn pm_lp_cooldown(effective_tier: u8) -> i64 {
+    let days: i64 = match effective_tier {
+        0 => 3,
+        1 => 7,
+        2 => 14,
+        _ => 30,
+    };
+    days * 86_400
+}
+
+/// A position's share of the PM LP pool, in bps of `total_staked`. Mirrors `backstop_share_bps`,
+/// including its zero-total-staked handling (max severity rather than a division by zero).
+fn pm_lp_share_bps(amount_staked: u64, total_staked: u64) -> u64 {
+    if total_staked == 0 {
+        return 10_000;
+    }
+    ((amount_staked as u128).saturating_mul(10_000) / total_staked as u128).min(10_000) as u64
+}
+
+/// Cooldown multiplier (in tenths) by pool-share bucket — identical bands to
+/// `backstop_whale_multiplier_tenths`: <5% of pool 1.0x, 5-15% 1.5x, 15-30% 2.0x, >=30% 3.0x.
+fn pm_lp_whale_multiplier_tenths(share_bps: u64) -> u64 {
+    match share_bps {
+        0..=499 => 10,
+        500..=1499 => 15,
+        1500..=2999 => 20,
+        _ => 30,
+    }
+}
+
+/// The full required PM LP cooldown: the ARE tier ladder scaled by the whale multiplier for this
+/// position's current pool share. Mirrors `required_backstop_cooldown`'s escalate-only recheck
+/// discipline — evaluated fresh at both `request_unstake_pm_lp` and `withdraw_pm_lp`, the latter
+/// taking the stricter (`.max()`) of the two, so a cooling position can only ever face a longer
+/// wait if risk or share rises while pending, never a shorter one.
+fn required_pm_lp_cooldown(effective_tier: u8, share_bps: u64) -> i64 {
+    pm_lp_cooldown(effective_tier).saturating_mul(pm_lp_whale_multiplier_tenths(share_bps) as i64) / 10
 }
 
 /// Decode a persisted `RiskTier` discriminant (e.g. `QueuedPayout.settlement_tier`).
@@ -7942,6 +8203,239 @@ impl<'info> DrawBackstop<'info> {
     }
 }
 
+// ───────────── Prediction Market LP Pool Accounts contexts (Phase 2 pooled-LP AMM plan) ─────────────
+// Structural mirror of the Investor Backstop Pool Accounts contexts above. Unlike Backstop (which
+// pays out two distinct mints — staked $FIRMA principal and SOL premium — this pool's principal AND
+// yield are both denominated in the firm's own `firma_mint`, so one `staker_firma` destination
+// account covers both legs instead of two.
+
+#[derive(Accounts)]
+pub struct InitPmLpPool<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + PredictionMarketLpPool::INIT_SPACE,
+        seeds = [b"pm_lp_pool", firm_state.key().as_ref()],
+        bump
+    )]
+    pub pm_lp_pool: Box<Account<'info, PredictionMarketLpPool>>,
+
+    #[account(
+        init,
+        payer = payer,
+        token::mint = firma_mint,
+        token::authority = pm_lp_pool,
+        seeds = [b"pm_lp_escrow", firm_state.key().as_ref()],
+        bump
+    )]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        init,
+        payer = payer,
+        token::mint = firma_mint,
+        token::authority = pm_lp_pool,
+        seeds = [b"pm_lp_yield", firm_state.key().as_ref()],
+        bump
+    )]
+    pub yield_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct StakePmLp<'info> {
+    #[account(mut)]
+    pub staker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(mut, seeds = [b"pm_lp_pool", firm_state.key().as_ref()], bump = pm_lp_pool.bump)]
+    pub pm_lp_pool: Box<Account<'info, PredictionMarketLpPool>>,
+
+    #[account(
+        init_if_needed,
+        payer = staker,
+        space = 8 + PredictionMarketLpPosition::INIT_SPACE,
+        seeds = [b"pm_lp_pos", firm_state.key().as_ref(), staker.key().as_ref()],
+        bump
+    )]
+    pub position: Box<Account<'info, PredictionMarketLpPosition>>,
+
+    #[account(mut, address = pm_lp_pool.escrow_vault)]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    // NOTE: deliberately no ownership/identity constraint linking `staker` to any market or trader —
+    // see `stake_pm_lp`'s doc comment. Anyone, including a trader, may fund this shared pool.
+    #[account(mut, token::mint = firm_state.firma_mint, token::authority = staker)]
+    pub staker_firma: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> StakePmLp<'info> {
+    /// Escrow staked $FIRMA from the LP into the pool's escrow vault.
+    fn escrow(&self, amount: u64) -> Result<()> {
+        token::transfer(
+            CpiContext::new(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.staker_firma.to_account_info(),
+                    to: self.escrow_vault.to_account_info(),
+                    authority: self.staker.to_account_info(),
+                },
+            ),
+            amount,
+        )
+    }
+}
+
+#[derive(Accounts)]
+pub struct RequestUnstakePmLp<'info> {
+    pub staker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(seeds = [b"platform_risk"], bump = platform_risk.bump)]
+    pub platform_risk: Box<Account<'info, PlatformRiskState>>,
+
+    #[account(seeds = [b"pm_lp_pool", firm_state.key().as_ref()], bump = pm_lp_pool.bump)]
+    pub pm_lp_pool: Box<Account<'info, PredictionMarketLpPool>>,
+
+    #[account(
+        mut,
+        seeds = [b"pm_lp_pos", firm_state.key().as_ref(), staker.key().as_ref()],
+        bump = position.bump,
+        constraint = position.staker == staker.key() @ FirmError::Unauthorized,
+    )]
+    pub position: Box<Account<'info, PredictionMarketLpPosition>>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawPmLp<'info> {
+    pub staker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(seeds = [b"platform_risk"], bump = platform_risk.bump)]
+    pub platform_risk: Box<Account<'info, PlatformRiskState>>,
+
+    #[account(mut, seeds = [b"pm_lp_pool", firm_state.key().as_ref()], bump = pm_lp_pool.bump)]
+    pub pm_lp_pool: Box<Account<'info, PredictionMarketLpPool>>,
+
+    #[account(
+        mut,
+        seeds = [b"pm_lp_pos", firm_state.key().as_ref(), staker.key().as_ref()],
+        bump = position.bump,
+        constraint = position.staker == staker.key() @ FirmError::Unauthorized,
+    )]
+    pub position: Box<Account<'info, PredictionMarketLpPosition>>,
+
+    #[account(mut, address = pm_lp_pool.escrow_vault)]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = pm_lp_pool.yield_vault)]
+    pub yield_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = firm_state.firma_mint,
+        constraint = staker_firma.owner == staker.key() @ FirmError::Unauthorized,
+    )]
+    pub staker_firma: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> WithdrawPmLp<'info> {
+    fn pay_principal(&self, amount: u64) -> Result<()> {
+        self.pay(self.escrow_vault.to_account_info(), amount)
+    }
+    fn pay_yield(&self, amount: u64) -> Result<()> {
+        self.pay(self.yield_vault.to_account_info(), amount)
+    }
+    fn pay(&self, from: AccountInfo<'info>, amount: u64) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let bump = [self.pm_lp_pool.bump];
+        let seeds = pm_lp_signer(&self.pm_lp_pool.firm, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer { from, to: self.staker_firma.to_account_info(), authority: self.pm_lp_pool.to_account_info() },
+                &[&seeds],
+            ),
+            amount,
+        )
+    }
+}
+
+#[derive(Accounts)]
+pub struct ClaimPmLpYield<'info> {
+    pub staker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(mut, seeds = [b"pm_lp_pool", firm_state.key().as_ref()], bump = pm_lp_pool.bump)]
+    pub pm_lp_pool: Box<Account<'info, PredictionMarketLpPool>>,
+
+    #[account(
+        mut,
+        seeds = [b"pm_lp_pos", firm_state.key().as_ref(), staker.key().as_ref()],
+        bump = position.bump,
+        constraint = position.staker == staker.key() @ FirmError::Unauthorized,
+    )]
+    pub position: Box<Account<'info, PredictionMarketLpPosition>>,
+
+    #[account(mut, address = pm_lp_pool.yield_vault)]
+    pub yield_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = firm_state.firma_mint,
+        constraint = staker_firma.owner == staker.key() @ FirmError::Unauthorized,
+    )]
+    pub staker_firma: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> ClaimPmLpYield<'info> {
+    fn pay_yield(&self, amount: u64) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let bump = [self.pm_lp_pool.bump];
+        let seeds = pm_lp_signer(&self.pm_lp_pool.firm, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.yield_vault.to_account_info(),
+                    to: self.staker_firma.to_account_info(),
+                    authority: self.pm_lp_pool.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
+    }
+}
+
 // Accounts are Box'd to keep the BPF stack frame under 4 KB.
 #[derive(Accounts)]
 pub struct DrawTreasuryFirma<'info> {
@@ -9266,6 +9760,77 @@ pub struct BackstopPool {
     pub unallocated_firma: u64,
 }
 
+// ───────── Prediction Market LP Pool (Phase 2 of the pooled-LP AMM plan) ─────────
+
+/// A single shared per-firm pool of community-provided $FIRMA liquidity that the protocol
+/// algorithmically allocates across every eligible trader's prediction-market curve (Phase 3's
+/// `allocate_pool_to_curve`). Structurally a near-exact mirror of `BackstopPool` above — same
+/// PRECISION-scaled accumulator math, same whale-tiered cooldown, same rolling daily-outflow cap —
+/// because it is solving the same problem (mutualized, slashable pooled capital with a fair
+/// pro-rata yield/loss split) for a different destination. Unlike `BackstopPool`, both legs
+/// (principal and yield) are denominated in the same `firma_mint`, so there is one debt field per
+/// leg instead of a separate SOL-premium leg. Seeds: ["pm_lp_pool", firm].
+#[account]
+#[derive(InitSpace)]
+pub struct PredictionMarketLpPool {
+    pub firm: Pubkey,
+    /// Loss-adjusted LP principal (mirrors `BackstopPool.total_staked`) — the LOSS denominator.
+    /// Drops when a curve allocation realizes a loss (Phase 3); a draw is mutualised over the
+    /// principal at risk at draw time.
+    pub total_staked: u64,
+    /// Nominal principal — the YIELD denominator (mirrors `total_premium_weight`). A realized curve
+    /// loss must NOT shrink this: yield accrues on nominal stake, so folding it over a
+    /// loss-reduced denominator would let `Σ pending_yield` exceed what was actually funded — the
+    /// same F-M-5 insolvency class `BackstopPool.total_premium_weight`'s doc comment documents.
+    pub total_yield_weight: u64,
+    /// Accrued trading-fee yield per staked token, scaled by PRECISION.
+    pub yield_acc: u128,
+    /// $FIRMA loss per staked token from realized curve draws, scaled by PRECISION.
+    pub loss_acc: u128,
+    /// Yield retained when nothing is staked; flushed on the next fold.
+    pub unallocated_yield: u64,
+    pub escrow_vault: Pubkey,
+    pub yield_vault: Pubkey,
+    /// Lifetime capital cranked out to curves via Phase 3's `allocate_pool_to_curve`. Reserved
+    /// here; unused (stays 0) by every Phase 2 instruction.
+    pub total_drawn: u64,
+    /// Lifetime capital cranked back from curves via Phase 3's `deallocate_pool_from_curve`.
+    /// Reserved here; unused (stays 0) by every Phase 2 instruction.
+    pub total_returned: u64,
+    pub last_yield_at: i64,
+    /// Rolling-day outflow gate (anti-bank-run, same idiom as `BackstopPool.daily_withdrawn`):
+    /// cumulative surviving $FIRMA paid out by `withdraw_pm_lp` during `withdraw_day`.
+    pub daily_withdrawn: u64,
+    /// Unix day (`ts / 86_400`) that `daily_withdrawn` accrues against.
+    pub withdraw_day: i64,
+    /// Max % of `total_staked` deployable across all curves at once (Phase 3). Defaults to
+    /// `DEFAULT_PM_LP_ALLOCATION_CAP_BPS` at `init_pm_lp_pool`; not enforced by any Phase 2
+    /// instruction.
+    pub allocation_cap_bps: u16,
+    pub bump: u8,
+}
+
+/// Per-staker PM LP position. Seeds: ["pm_lp_pos", firm, staker]. Mirrors `BackstopPosition`
+/// field-for-field, minus the separate SOL-premium debt — this pool's yield is denominated in the
+/// same $FIRMA mint as the principal, so one debt field covers it instead of two. The whole
+/// position enters cooldown on `request_unstake_pm_lp` and stays slashable until `withdraw_pm_lp`.
+#[account]
+#[derive(InitSpace)]
+pub struct PredictionMarketLpPosition {
+    pub staker: Pubkey,
+    pub firm: Pubkey,
+    pub amount_staked: u64,
+    pub yield_debt: u128,
+    pub loss_debt: u128,
+    /// 0 = no pending withdrawal; else the unix time the cooldown elapses.
+    pub cooldown_ends_at: i64,
+    /// Unix time `request_unstake_pm_lp` was called (anti-bank-run escalation recheck, mirrors
+    /// `BackstopPosition.cooldown_requested_at`).
+    pub cooldown_requested_at: i64,
+    pub staked_at: i64,
+    pub bump: u8,
+}
+
 // ───────────────────────── Affiliate program (§17.1) ─────────────────────────
 
 /// Per-firm affiliate program config + SOL accumulator handle. Seeds: ["affiliate_program", firm].
@@ -9730,6 +10295,37 @@ pub struct BackstopFirmaYieldClaimed {
     pub firm: Pubkey,
     pub staker: Pubkey,
     pub firma: u64,
+}
+
+// ── Prediction Market LP Pool (Phase 2 pooled-LP AMM plan) ──
+
+#[event]
+pub struct PmLpStaked {
+    pub firm: Pubkey,
+    pub staker: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct PmLpUnstakeRequested {
+    pub firm: Pubkey,
+    pub staker: Pubkey,
+    pub unlocks_at: i64,
+}
+
+#[event]
+pub struct PmLpWithdrawn {
+    pub firm: Pubkey,
+    pub staker: Pubkey,
+    pub surviving: u64,
+    pub yield_paid: u64,
+}
+
+#[event]
+pub struct PmLpYieldClaimed {
+    pub firm: Pubkey,
+    pub staker: Pubkey,
+    pub yield_paid: u64,
 }
 
 #[event]
@@ -10218,6 +10814,19 @@ pub enum FirmError {
     BackstopOutflowCapExceeded,
     #[msg("backstop withdrawals are frozen while the firm's velocity-break circuit breaker is active")]
     BackstopWithdrawFrozen,
+    // Appended (Phase 2 — Prediction Market LP Pool, mirrors the analogous Backstop errors 1:1).
+    #[msg("a PM LP withdrawal cooldown is already pending")]
+    PmLpCooldownActive,
+    #[msg("no PM LP withdrawal cooldown has been requested")]
+    PmLpNoCooldownRequested,
+    #[msg("PM LP withdrawal cooldown has not elapsed")]
+    PmLpCooldownNotElapsed,
+    #[msg("nothing staked in the prediction-market LP pool")]
+    PmLpNothingStaked,
+    #[msg("this withdrawal would exceed the PM LP pool's daily outflow cap (PM_LP_DAILY_OUTFLOW_CAP_BPS) — retry with a smaller amount or wait for the next window")]
+    PmLpDailyCapExceeded,
+    #[msg("PM LP withdrawals are frozen while the firm's velocity-break circuit breaker is active")]
+    PmLpVelocityBreakActive,
 }
 
 #[cfg(test)]
@@ -11767,6 +12376,246 @@ mod tests {
                 "split withdrawal over-paid (seed {seed}): {paid} > {surviving_total0}"
             );
         }
+    }
+
+    // ───────── Prediction Market LP Pool (Phase 2 pooled-LP AMM plan) ─────────
+    // Mirrors the Backstop test coverage immediately above, adapted to the PM LP pool's single-mint
+    // (principal + yield both in $FIRMA) shape and its duplicated `pm_lp_*` cooldown helpers.
+
+    #[test]
+    fn pm_lp_stake_sets_fresh_debt_with_no_retroactive_yield() {
+        // Mirrors `stake_pm_lp`'s debt-assignment logic directly: a fresh position staking AFTER
+        // some yield has already accrued must owe none of that past yield — `yield_debt` bakes the
+        // current accumulator into the new position's baseline, exactly as `stake_backstop` does
+        // for premium.
+        let yield_acc = (500u128 * PRECISION) / 1_000; // 0.5 $FIRMA/token already accrued
+        let loss_acc = 0u128;
+        let mut pool_total_staked = 1_000u64;
+        let mut pool_total_yield_weight = 1_000u64;
+
+        let amount = 250u64;
+        pool_total_staked = pool_total_staked.checked_add(amount).unwrap();
+        pool_total_yield_weight = pool_total_yield_weight.checked_add(amount).unwrap();
+        let pos_yield_debt = yield_debt(amount, yield_acc);
+        let pos_loss_debt = yield_debt(amount, loss_acc);
+
+        assert_eq!(pool_total_staked, 1_250);
+        assert_eq!(pool_total_yield_weight, 1_250);
+        // The new position owes exactly the accumulator × its own stake — no MORE (over-charging)
+        // and no LESS (double-dipping into value that predates its stake).
+        assert_eq!(pos_yield_debt, (amount as u128 * yield_acc) / PRECISION);
+        assert_eq!(pos_loss_debt, 0);
+        // Immediately after staking, pending yield against that debt is exactly zero — no
+        // retroactive claim on yield that accrued before this position existed.
+        assert_eq!(pending_yield(amount, yield_acc, pos_yield_debt), 0);
+    }
+
+    #[test]
+    fn pm_lp_partial_withdrawal_scales_debt_proportionally_not_reset() {
+        // Direct unit-level pin of `withdraw_pm_lp`'s remainder-debt formula: original_debt *
+        // remainder / staked — NOT `yield_debt(remainder, live_acc)`. The two coincide only when the
+        // position's debt was already exactly proportional to the live accumulator (the fresh-stake
+        // case); once yield has moved past the position's baseline they diverge, and resetting to
+        // the live accumulator would erase the remainder's already-accrued, not-yet-realized share —
+        // the exact bug `backstop_partial_withdrawal_conserves_value` guards against for Backstop.
+        let staked: u64 = 1_000;
+        let acc: u128 = (300u128 * PRECISION) / 1_000; // 0.3/token accrued since this position's baseline
+        let debt: u128 = yield_debt(staked / 2, acc); // baseline set when only half the stake existed
+        let amount: u64 = 400; // partial withdrawal
+        let remainder = staked - amount;
+
+        let scaled_debt = debt.saturating_mul(remainder as u128) / staked as u128;
+        let reset_debt = yield_debt(remainder, acc);
+        assert_ne!(
+            scaled_debt, reset_debt,
+            "test fixture must exercise a case where scaling and resetting diverge"
+        );
+
+        let pending_with_scaled = pending_yield(remainder, acc, scaled_debt);
+        let pending_with_reset = pending_yield(remainder, acc, reset_debt);
+        assert!(
+            pending_with_scaled > pending_with_reset,
+            "proportional scaling must leave the remainder's already-accrued share intact; a \
+             live-accumulator reset would erase it"
+        );
+    }
+
+    #[test]
+    fn pm_lp_partial_withdrawal_conserves_value() {
+        // Fuzz-parity with `backstop_partial_withdrawal_conserves_value`: splitting a matured
+        // position's surviving payout across multiple partial `withdraw_pm_lp` calls must never let
+        // the staker collect MORE than the one-shot surviving total.
+        for seed in 0..20_000u64 {
+            let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(23);
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let staked0: u64 = 1 + (next() % 1_000_000);
+            let acc = ((next() % 2_000_000_000) as u128 * PRECISION) / 1_000_000_000; // 0x-2x per-token
+            let debt0 = yield_debt(staked0 / 2, acc); // a plausible prior baseline, not necessarily 0
+            let pending_loss0 = pending_yield(staked0, acc, debt0);
+            let surviving_total0 = staked0.saturating_sub(pending_loss0);
+
+            let mut staked = staked0;
+            let mut debt = debt0;
+            let mut paid: u64 = 0;
+            for _ in 0..10 {
+                if staked == 0 {
+                    break;
+                }
+                let amount = (next() % staked).saturating_add(1).min(staked);
+                let pending_loss = pending_yield(staked, acc, debt);
+                let surviving = staked.saturating_sub(pending_loss);
+                let slice = ((amount as u128).saturating_mul(surviving as u128) / staked as u128) as u64;
+                paid = paid.saturating_add(slice);
+                let remainder = staked - amount;
+                if remainder == 0 {
+                    staked = 0;
+                } else {
+                    debt = debt.saturating_mul(remainder as u128) / staked as u128;
+                    staked = remainder;
+                }
+            }
+            assert!(
+                paid <= surviving_total0,
+                "split withdrawal over-paid (seed {seed}): {paid} > {surviving_total0}"
+            );
+        }
+    }
+
+    #[test]
+    fn pm_lp_daily_cap_blocks_same_day_then_resets_next_day() {
+        // Concrete two-step trace of `withdraw_pm_lp`'s reset-then-check-then-record idiom: an
+        // over-cap request is rejected same-day, and the identical request succeeds once the day
+        // rolls over and `daily_withdrawn` resets to 0.
+        let total_staked: u64 = 100_000;
+        let cap = (total_staked as u128 * PM_LP_DAILY_OUTFLOW_CAP_BPS as u128 / 10_000) as u64; // 10%
+        assert_eq!(cap, 10_000);
+
+        let mut daily_withdrawn: u64 = 0;
+        let mut withdraw_day: i64 = 0;
+        let now_day0 = 5 * 86_400; // arbitrary day 5, mid-day
+        let day0 = now_day0 / 86_400;
+        if day0 != withdraw_day {
+            daily_withdrawn = 0;
+            withdraw_day = day0;
+        }
+
+        // An over-cap request is rejected.
+        let over_cap_amount = cap + 1;
+        assert!(daily_withdrawn.saturating_add(over_cap_amount) > cap, "over-cap request must be rejected same-day");
+
+        // A within-cap request the same day is accepted and recorded.
+        let within_cap = cap; // exactly at the cap
+        assert!(daily_withdrawn.saturating_add(within_cap) <= cap);
+        daily_withdrawn = daily_withdrawn.saturating_add(within_cap);
+        assert_eq!(daily_withdrawn, cap);
+
+        // A further request the SAME day, even for 1 unit, is now rejected — the day's cap is spent.
+        assert!(daily_withdrawn.saturating_add(1) > cap);
+
+        // The next day, the reset-then-check idiom clears `daily_withdrawn` before the check runs,
+        // so the identical (previously-rejected) request now succeeds.
+        let now_day1 = now_day0 + 86_400;
+        let day1 = now_day1 / 86_400;
+        if day1 != withdraw_day {
+            daily_withdrawn = 0;
+            withdraw_day = day1;
+        }
+        assert_eq!(withdraw_day, day1, "the tracked day must roll forward");
+        assert_eq!(daily_withdrawn, 0);
+        assert!(
+            daily_withdrawn.saturating_add(within_cap) <= cap,
+            "the cap must be fully available again on a new UTC day"
+        );
+    }
+
+    #[test]
+    fn pm_lp_daily_outflow_cap_never_exceeded_within_a_day() {
+        // Fuzz-parity with `backstop_daily_outflow_cap_never_exceeded_within_a_day`: no accepted
+        // withdrawal ever pushes a day's cumulative outflow past the cap computed at that moment,
+        // against a pool that shrinks by each accepted surviving slice.
+        for seed in 0..20_000u64 {
+            let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(29);
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut total_staked: u64 = 1_000_000 + (next() % 1_000_000);
+            let mut withdraw_day: i64 = -1;
+            let mut daily_withdrawn: u64 = 0;
+            let mut now: i64 = 0;
+            for _ in 0..80 {
+                if total_staked == 0 {
+                    break;
+                }
+                now += (next() % 200_000) as i64;
+                let day = now / 86_400;
+                if day != withdraw_day {
+                    daily_withdrawn = 0;
+                    withdraw_day = day;
+                }
+                let cap = (total_staked as u128 * PM_LP_DAILY_OUTFLOW_CAP_BPS as u128 / 10_000) as u64;
+                let attempt = (next() % (total_staked / 2 + 1)).max(1);
+                if daily_withdrawn.saturating_add(attempt) <= cap {
+                    daily_withdrawn += attempt;
+                    total_staked -= attempt;
+                    assert!(daily_withdrawn <= cap, "day {day} withdrew {daily_withdrawn} > cap {cap} (seed {seed})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pm_lp_whale_tier_cooldown_lengthens_with_share() {
+        // Same bands/tiers as Backstop's (duplicated helpers — see `pm_lp_whale_multiplier_tenths`'s
+        // doc comment for why): pin the multiplier ladder and confirm the composed cooldown is
+        // strictly monotonic in pool share at a fixed ARE tier.
+        assert_eq!(pm_lp_whale_multiplier_tenths(0), 10);
+        assert_eq!(pm_lp_whale_multiplier_tenths(499), 10);
+        assert_eq!(pm_lp_whale_multiplier_tenths(500), 15);
+        assert_eq!(pm_lp_whale_multiplier_tenths(1499), 15);
+        assert_eq!(pm_lp_whale_multiplier_tenths(1500), 20);
+        assert_eq!(pm_lp_whale_multiplier_tenths(2999), 20);
+        assert_eq!(pm_lp_whale_multiplier_tenths(3000), 30);
+        assert_eq!(pm_lp_whale_multiplier_tenths(10_000), 30);
+
+        let healthy = 0u8;
+        let c_small = required_pm_lp_cooldown(healthy, 100); // <5%
+        let c_mid = required_pm_lp_cooldown(healthy, 1000); // 5-15%
+        let c_big = required_pm_lp_cooldown(healthy, 2000); // 15-30%
+        let c_whale = required_pm_lp_cooldown(healthy, 5000); // >=30%
+        assert!(
+            c_small < c_mid && c_mid < c_big && c_big < c_whale,
+            "cooldown must strictly lengthen as pool share grows"
+        );
+        assert_eq!(c_small, 3 * 86_400); // HEALTHY base, 1.0x
+        assert_eq!(c_whale, 3 * 86_400 * 3); // HEALTHY base, 3.0x
+    }
+
+    #[test]
+    fn pm_lp_claim_pays_exact_pending_and_resets_debt_to_live_accumulator() {
+        // Mirrors `claim_pm_lp_yield`'s body directly: pay `pending_yield(staked, acc, debt)`, then
+        // set debt = yield_debt(staked, acc) — so an immediate second claim (no new yield folded)
+        // pays 0.
+        let staked: u64 = 777;
+        let acc: u128 = (1_234u128 * PRECISION) / 1_000; // 1.234/token
+        let debt: u128 = yield_debt(staked / 3, acc / 2); // some arbitrary prior baseline
+
+        let paid = pending_yield(staked, acc, debt);
+        let new_debt = yield_debt(staked, acc);
+
+        // Exactly the accrued-but-unclaimed amount, no more/less.
+        assert_eq!(paid, ((staked as u128).saturating_mul(acc) / PRECISION).saturating_sub(debt) as u64);
+        // Debt now sits exactly on the live accumulator...
+        assert_eq!(new_debt, yield_debt(staked, acc));
+        // ...so an immediate re-claim against the SAME accumulator pays nothing further.
+        assert_eq!(pending_yield(staked, acc, new_debt), 0);
     }
 
     #[test]
