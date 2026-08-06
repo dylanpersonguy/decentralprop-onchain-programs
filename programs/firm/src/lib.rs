@@ -2198,18 +2198,23 @@ pub mod firm {
         Ok(())
     }
 
-    // ───────────── Prediction Market Curve (Phase 3 pooled-LP AMM plan) ─────────────
-    // Per-market two-sided AMM — see this section's header comment above `MarketCurve` for the
-    // judgment call (two independent CPMM legs, not a true complementary-outcome AMM) and
-    // `pm_redeem_payout`'s doc comment for how settlement stays solvent despite it.
+    // ───────────── Prediction Market Curve (split/merge/swap CTF-style design, 2026-08-06) ─────────────
+    // Replaces the original two-independent-CPMM-leg design (DEC-89) after SIM 12
+    // (`reports/2026-08-06-prediction-market-v2-amm-economics-sim.md`) proved that design's solvency
+    // haircut bit ~65-70% of the time under lopsided flow — the market's ordinary state near real
+    // resolution, not an edge case. See this file's struct-level comment above `MarketCurve` for the
+    // full design and the invariant proof; `pm_void_redeem_payout`'s doc comment for the void formula.
 
-    /// Initialise a per-market two-sided AMM curve, 1:1 bound to a real on-chain evaluation
+    /// Initialise a per-market split/merge/swap curve, 1:1 bound to a real on-chain evaluation
     /// (`challenge`) via PDA seeds. Signed by the challenge's settlement authority — see
     /// `require_market_curve_authority`'s doc comment for why this binds the same way
     /// `require_firm_settlement_authority` does WITHOUT that gate's additional settlement-finality
     /// checks (this curve opens WHILE the evaluation is still active). Eligibility itself has no
     /// on-chain representation; it's enforced entirely by who is allowed to call this instruction,
-    /// same trust model `settlement_authority` already carries everywhere else in this file.
+    /// same trust model `settlement_authority` already carries everywhere else in this file. Creates
+    /// the curve's own AMM inventory position EAGERLY (not lazily via `init_if_needed` later) — every
+    /// later instruction that reads it can then be a plain `mut` + `address =` check instead of
+    /// carrying init-or-not branching in keeper-gated, money-moving code.
     pub fn init_market_curve(
         ctx: Context<InitMarketCurve>,
         pass_virtual_seed: u64,
@@ -2220,9 +2225,9 @@ pub mod firm {
         pool_fee_bps: u16,
     ) -> Result<()> {
         require_market_curve_authority(&ctx.accounts.challenge, &ctx.accounts.firm_state)?;
-        // Both virtual seeds must be non-zero: `pm_curve_available_shares` scales its notional supply
-        // cap off them, so a zero seed would leave that leg permanently unable to sell a single share
-        // (mirrors `bonding_curve::initialize_curve`'s own `virtual_sol > 0` requirement).
+        // Both virtual seeds must be non-zero: they're the only depth a fresh, never-split-into curve
+        // has, so a zero seed would leave that leg permanently untradeable (mirrors
+        // `bonding_curve::initialize_curve`'s own `virtual_sol > 0` requirement).
         require!(pass_virtual_seed > 0 && fail_virtual_seed > 0, FirmError::ZeroAmount);
         require!(
             (firm_fee_bps as u32) + (platform_fee_bps as u32) + (pool_fee_bps as u32) == fee_bps as u32,
@@ -2234,14 +2239,12 @@ pub mod firm {
         curve.challenge = ctx.accounts.challenge.key();
         curve.trader = ctx.accounts.challenge.trader;
         curve.firma_mint = ctx.accounts.firma_mint.key();
-        curve.pass_vault = ctx.accounts.pass_vault.key();
-        curve.fail_vault = ctx.accounts.fail_vault.key();
+        curve.collateral_vault = ctx.accounts.collateral_vault.key();
+        curve.curve_inventory_position = ctx.accounts.curve_inventory_position.key();
         curve.pass_virtual = pass_virtual_seed;
-        curve.pass_real = 0;
-        curve.pass_shares = 0;
         curve.fail_virtual = fail_virtual_seed;
-        curve.fail_real = 0;
-        curve.fail_shares = 0;
+        curve.total_pass_outstanding = 0;
+        curve.total_fail_outstanding = 0;
         curve.pool_allocated = 0;
         curve.topup_deposited = 0;
         curve.fee_bps = fee_bps;
@@ -2256,158 +2259,168 @@ pub mod firm {
         curve.opened_at = now;
         curve.settled_at = 0;
         curve.bump = ctx.bumps.curve;
-        emit!(MarketCurveInitialized {
-            curve: curve.key(),
-            challenge: curve.challenge,
-            firm: curve.firm,
-            trader: curve.trader,
-        });
+        let curve_key = curve.key();
+
+        // The curve's own AMM inventory — a `MarketPosition` owned by the curve's OWN PDA as
+        // `holder`. Sound because a PDA is guaranteed off the ed25519 curve, so `curve_key` can never
+        // collide with a real wallet's pubkey. Starts at (0, 0) real. CORRECTION (caught devnet-proving
+        // this phase, not a stale comment left uncorrected): the virtual seeds shape PRICING only
+        // (`swap_curve_shares`' `eff_from`/`reserve_to`) — they can never be PAID OUT (`swap`'s own
+        // `net_out <= inv_to0` guard checks REAL inventory only), so a fresh curve with zero real
+        // inventory has a defined price but is NOT actually tradeable until `add_curve_topup` or
+        // `allocate_pool_to_curve` seeds real depth on both sides. This differs from the old two-leg
+        // design, where a buy minted notional shares with no real-backing constraint — the new design's
+        // swap output is always real (redeemable/mergeable later), so it can never come from a phantom
+        // seed. Real depth is added via `add_curve_topup`/`allocate_pool_to_curve`.
+        let inv = &mut ctx.accounts.curve_inventory_position;
+        inv.holder = curve_key;
+        inv.curve = curve_key;
+        inv.pass_shares = 0;
+        inv.fail_shares = 0;
+        inv.bump = ctx.bumps.curve_inventory_position;
+
+        emit!(MarketCurveInitialized { curve: curve_key, challenge: curve.challenge, firm: curve.firm, trader: curve.trader });
         Ok(())
     }
 
-    /// Buy shares of one side of a market. Permissionless — any signer may buy. Exact math reuses
-    /// `bonding_curve::fee_amount`/`buy_output` UNMODIFIED; see `pm_curve_available_shares`'s doc
-    /// comment for why the reserve fed into `buy_output` is a DERIVED quantity, not the stored
-    /// `pass_shares`/`fail_shares` field directly.
-    pub fn buy_shares(
-        ctx: Context<BuyMarketShares>,
-        side: PmSide,
-        collateral_in: u64,
-        min_shares_out: u64,
-    ) -> Result<()> {
-        // SECURITY-CRITICAL, same standing as `add_curve_topup`'s identical first check (PM2-SELFTRADE-1,
-        // 2026-08-06 adversarial audit): the trader controls their own evaluation's PASS/FAIL outcome
-        // deterministically, so without this a trader could buy winning-side shares on their own market
-        // with their own ordinary wallet — no proxy needed — and redeem a payout funded by pooled LP
-        // capital and honest bettors, a direct, guaranteed-profit self-dealing drain. `add_curve_topup`
-        // had this ban; `buy_shares` — the instruction that actually creates a redeemable position, and
-        // so the one that most needed it — did not.
-        require!(ctx.accounts.buyer.key() != ctx.accounts.curve.trader, FirmError::PmSelfLpBanned);
-        require!(collateral_in > 0, FirmError::ZeroAmount);
+    /// Mint a matched PASS+FAIL pair 1:1 from real collateral — the only instruction (besides
+    /// `merge_shares`) that ever touches `collateral_vault`. Permissionless, self-only (the position
+    /// PDA is seeded on the caller's own key, no delegate/beneficiary parameter — closes a
+    /// wallet-clustering gap an adversarial review flagged for a genericized version of this). Pure
+    /// 1:1 accounting, zero curve math — direction-neutral even for the market's own trader (holding
+    /// an always-equal PASS/FAIL pair has no exploitable directional exposure; see `swap_curve_shares`
+    /// for where the actual self-trade ban lives and why).
+    pub fn split_collateral(ctx: Context<SplitCollateral>, amount: u64) -> Result<()> {
+        require!(amount > 0, FirmError::ZeroAmount);
         require!(ctx.accounts.curve.status == PmCurveStatus::Open, FirmError::PmMarketNotOpen);
 
-        let fee_bps = ctx.accounts.curve.fee_bps;
-        let fee = bonding_curve::fee_amount(collateral_in, fee_bps);
-        let net = collateral_in.checked_sub(fee).ok_or(FirmError::MathOverflow)?;
-
-        let (virtual_r, real_r, shares_outstanding) = match side {
-            PmSide::Pass => {
-                (ctx.accounts.curve.pass_virtual, ctx.accounts.curve.pass_real, ctx.accounts.curve.pass_shares)
-            }
-            PmSide::Fail => {
-                (ctx.accounts.curve.fail_virtual, ctx.accounts.curve.fail_real, ctx.accounts.curve.fail_shares)
-            }
-        };
-        let available = pm_curve_available_shares(virtual_r, shares_outstanding);
-        let eff = (virtual_r as u128).saturating_add(real_r as u128);
-        let shares_out = bonding_curve::buy_output(eff, available as u128, net as u128)
-            .ok_or(FirmError::MathOverflow)?;
-        require!(shares_out > 0 && shares_out >= min_shares_out, FirmError::PmSlippageExceeded);
-
-        let new_real = real_r.checked_add(net).ok_or(FirmError::MathOverflow)?;
-        let new_shares_outstanding =
-            shares_outstanding.checked_add(shares_out).ok_or(FirmError::MathOverflow)?;
-        let new_available = pm_curve_available_shares(virtual_r, new_shares_outstanding);
-
-        // PRICE-CEILING GUARD (new, not in `bonding_curve` — this leg has no complementary side to
-        // arbitrage its price back down, plan judgment call #2): reject a buy that would push this
-        // leg's implied marginal price (`eff_reserve / available-to-sell`) past $1, the eventual
-        // settlement ceiling. Integer comparison only, no floating point.
-        let eff_after = eff.saturating_add(net as u128);
-        require!(eff_after <= new_available as u128, FirmError::PmPriceCeilingExceeded);
-
-        let (firm_cut, platform_cut, pool_cut) = split_curve_fee_3way(
-            fee,
-            ctx.accounts.curve.firm_fee_bps,
-            ctx.accounts.curve.platform_fee_bps,
-            ctx.accounts.curve.pool_fee_bps,
-            fee_bps,
-        );
-
-        // Collateral moves in BEFORE bookkeeping updates — mirrors `stake_pm_lp`'s escrow-then-record
-        // order.
-        ctx.accounts.transfer_collateral_in(side, collateral_in)?;
+        ctx.accounts.deposit(amount)?;
 
         let curve = &mut ctx.accounts.curve;
-        match side {
-            PmSide::Pass => {
-                curve.pass_real = new_real;
-                curve.pass_shares = new_shares_outstanding;
-            }
-            PmSide::Fail => {
-                curve.fail_real = new_real;
-                curve.fail_shares = new_shares_outstanding;
-            }
-        }
-        curve.firm_fees_accrued = curve.firm_fees_accrued.saturating_add(firm_cut);
-        curve.platform_fees_accrued = curve.platform_fees_accrued.saturating_add(platform_cut);
-        curve.pool_fees_accrued = curve.pool_fees_accrued.saturating_add(pool_cut);
+        curve.total_pass_outstanding = curve.total_pass_outstanding.checked_add(amount).ok_or(FirmError::MathOverflow)?;
+        curve.total_fail_outstanding = curve.total_fail_outstanding.checked_add(amount).ok_or(FirmError::MathOverflow)?;
         let curve_key = curve.key();
 
         let position = &mut ctx.accounts.position;
         if position.holder == Pubkey::default() {
-            position.holder = ctx.accounts.buyer.key();
+            position.holder = ctx.accounts.depositor.key();
             position.curve = curve_key;
             position.bump = ctx.bumps.position;
         }
-        match side {
-            PmSide::Pass => {
-                position.pass_shares =
-                    position.pass_shares.checked_add(shares_out).ok_or(FirmError::MathOverflow)?
-            }
-            PmSide::Fail => {
-                position.fail_shares =
-                    position.fail_shares.checked_add(shares_out).ok_or(FirmError::MathOverflow)?
-            }
-        }
+        position.pass_shares = position.pass_shares.checked_add(amount).ok_or(FirmError::MathOverflow)?;
+        position.fail_shares = position.fail_shares.checked_add(amount).ok_or(FirmError::MathOverflow)?;
 
-        emit!(MarketSharesBought {
-            curve: curve_key,
-            holder: position.holder,
-            side,
-            collateral_in,
-            shares_out,
-            fee,
-        });
+        emit!(CollateralSplit { curve: curve_key, depositor: position.holder, amount });
         Ok(())
     }
 
-    /// Sell shares of one side of a market back to the curve. Permissionless — any holder signer,
-    /// bounded by their own `MarketPosition` balance. Exact mirror of `buy_shares` using
-    /// `bonding_curve::sell_output` UNMODIFIED. No price-ceiling guard needed here — a sell only ever
-    /// moves price DOWN (real reserve shrinks, available-to-sell grows), the safe direction.
-    pub fn sell_shares(
-        ctx: Context<SellMarketShares>,
-        side: PmSide,
-        shares_in: u64,
-        min_collateral_out: u64,
+    /// Burn a matched PASS+FAIL pair 1:1 for real collateral — always available pre-resolution
+    /// (`Open` or `Locked`; blocked in `Void`/`Settled`, which each have their own single dedicated
+    /// redemption path — see `redeem_shares`/`redeem_void_shares`). This is what makes solvency a
+    /// closed accounting identity rather than a probabilistic one: any holder can always convert a
+    /// matched pair back to exactly what they paid, at any time, with zero curve-math dependency.
+    /// Permissionless, self-only (same reasoning as `split_collateral`).
+    pub fn merge_shares(ctx: Context<MergeShares>, amount: u64) -> Result<()> {
+        require!(amount > 0, FirmError::ZeroAmount);
+        require!(
+            ctx.accounts.curve.status == PmCurveStatus::Open || ctx.accounts.curve.status == PmCurveStatus::Locked,
+            FirmError::PmMarketNotOpen
+        );
+        require!(
+            ctx.accounts.position.pass_shares >= amount && ctx.accounts.position.fail_shares >= amount,
+            FirmError::PmInsufficientShares
+        );
+
+        ctx.accounts.pay(amount)?;
+
+        let curve = &mut ctx.accounts.curve;
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(amount);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(amount);
+        let curve_key = curve.key();
+
+        let position = &mut ctx.accounts.position;
+        position.pass_shares = position.pass_shares.saturating_sub(amount);
+        position.fail_shares = position.fail_shares.saturating_sub(amount);
+
+        emit!(SharesMerged { curve: curve_key, holder: position.holder, amount });
+        Ok(())
+    }
+
+    /// Trade `amount_in` of `from_side` for the other side, using the curve's own inventory
+    /// (`curve_inventory_position`) as the CPMM counterparty — a literal, unmodified reuse of
+    /// `bonding_curve::buy_output`, treating the two inventory balances (plus each side's phantom
+    /// virtual seed) as the two reserves. NO collateral moves here at all — this is pure share-for-share
+    /// accounting, which is exactly why it needs no new math and no `PmPriceCeilingExceeded`-style
+    /// guard: a real two-sided swap is self-arbitraging by construction (unlike the old design's
+    /// independent legs, which had no counterparty to arbitrage price back down).
+    ///
+    /// SECURITY-CRITICAL — this is where the self-trade ban actually belongs (PM2-SELFTRADE-1's
+    /// lesson carried forward): `split_collateral`/`merge_shares` are direction-neutral and harmless
+    /// even for the market's own trader (holding an always-equal pair has no exploitable edge), but a
+    /// trader who could swap could tilt a neutral pair into a net-directional position on the side
+    /// they will deterministically win — the exact drain PM2-SELFTRADE-1 closed for the old design.
+    /// Two checks, both required to fully close the loop: the position must belong to the signer (no
+    /// swapping someone else's shares), and the signer must not be this market's own trader.
+    ///
+    /// Fee mechanics (hand-verified to preserve `total_pass_outstanding == total_fail_outstanding`
+    /// exactly, not just approximately — see the worked trace in this instruction's implementation
+    /// plan / DEC-89): the swap itself is fee-free and perfectly conserves both totals (shares only
+    /// ever move between the user's position and curve inventory, never minted or burned). The fee is
+    /// then extracted via an internal self-merge on the curve's OWN inventory — burning `fee` from
+    /// BOTH its pass and fail balances and crediting `firm_fees_accrued`/`platform_fees_accrued`/
+    /// `pool_fees_accrued` via the existing `split_curve_fee_3way`, exactly as `buy_shares`/`sell_shares`
+    /// did in the old design. This is provably invariant-safe: a self-merge always burns equal amounts
+    /// from both sides, so it cannot un-equalize `total_pass_outstanding`/`total_fail_outstanding`
+    /// relative to each other, only shrink both by the same `fee`.
+    pub fn swap_curve_shares(
+        ctx: Context<SwapCurveShares>,
+        from_side: PmSide,
+        amount_in: u64,
+        min_amount_out: u64,
     ) -> Result<()> {
-        require!(shares_in > 0, FirmError::ZeroAmount);
+        require!(amount_in > 0, FirmError::ZeroAmount);
         require!(ctx.accounts.curve.status == PmCurveStatus::Open, FirmError::PmMarketNotOpen);
-        let held = match side {
+        require!(ctx.accounts.signer.key() != ctx.accounts.curve.trader, FirmError::PmSelfLpBanned);
+
+        let held = match from_side {
             PmSide::Pass => ctx.accounts.position.pass_shares,
             PmSide::Fail => ctx.accounts.position.fail_shares,
         };
-        require!(held >= shares_in, FirmError::PmInsufficientShares);
+        require!(held >= amount_in, FirmError::PmInsufficientShares);
+
+        let (from_virtual, to_virtual) = match from_side {
+            PmSide::Pass => (ctx.accounts.curve.pass_virtual, ctx.accounts.curve.fail_virtual),
+            PmSide::Fail => (ctx.accounts.curve.fail_virtual, ctx.accounts.curve.pass_virtual),
+        };
+        let (inv_from0, inv_to0) = match from_side {
+            PmSide::Pass => (ctx.accounts.curve_inventory.pass_shares, ctx.accounts.curve_inventory.fail_shares),
+            PmSide::Fail => (ctx.accounts.curve_inventory.fail_shares, ctx.accounts.curve_inventory.pass_shares),
+        };
+        let eff_from = (from_virtual as u128).saturating_add(inv_from0 as u128);
+        let reserve_to = (to_virtual as u128).saturating_add(inv_to0 as u128);
+        let gross_out = bonding_curve::buy_output(eff_from, reserve_to, amount_in as u128)
+            .ok_or(FirmError::MathOverflow)?;
+        require!(gross_out > 0, FirmError::PmSlippageExceeded);
 
         let fee_bps = ctx.accounts.curve.fee_bps;
-        let (virtual_r, real_r, shares_outstanding) = match side {
-            PmSide::Pass => {
-                (ctx.accounts.curve.pass_virtual, ctx.accounts.curve.pass_real, ctx.accounts.curve.pass_shares)
-            }
-            PmSide::Fail => {
-                (ctx.accounts.curve.fail_virtual, ctx.accounts.curve.fail_real, ctx.accounts.curve.fail_shares)
-            }
-        };
-        let available = pm_curve_available_shares(virtual_r, shares_outstanding);
-        let eff = (virtual_r as u128).saturating_add(real_r as u128);
-        let gross = bonding_curve::sell_output(eff, available as u128, shares_in as u128)
-            .ok_or(FirmError::MathOverflow)?;
-        // Never draw down the non-withdrawable virtual seed (mirrors `bonding_curve::sell`'s guard).
-        require!(gross <= real_r, FirmError::MathOverflow);
-        let fee = bonding_curve::fee_amount(gross, fee_bps);
-        let net_out = gross.saturating_sub(fee);
-        require!(net_out >= min_collateral_out, FirmError::PmSlippageExceeded);
+        let fee = bonding_curve::fee_amount(gross_out, fee_bps);
+        let net_out = gross_out.saturating_sub(fee);
+        require!(net_out >= min_amount_out, FirmError::PmSlippageExceeded);
+        // Never draw down the non-withdrawable virtual seed (mirrors the old design's `gross <=
+        // real_r` guard) — `net_out`, not `gross_out`, is what actually leaves curve inventory (the
+        // fee stays inside it, see below), so that's the amount checked against real inventory.
+        require!(net_out <= inv_to0, FirmError::MathOverflow);
+
+        // Swap step — fee-free, perfectly conserves both totals (see doc comment above).
+        let inv_from1 = inv_from0.checked_add(amount_in).ok_or(FirmError::MathOverflow)?;
+        let inv_to1 = inv_to0.checked_sub(net_out).ok_or(FirmError::MathOverflow)?;
+
+        // Fee self-merge — burns `fee` from BOTH sides of curve inventory, realized immediately as
+        // accrued fees (not left floating on an outcome-dependent side, and not swept until later —
+        // exactly `buy_shares`/`sell_shares`' old behavior for `*_fees_accrued`).
+        require!(inv_from1 >= fee && inv_to1 >= fee, FirmError::MathOverflow);
+        let inv_from2 = inv_from1 - fee;
+        let inv_to2 = inv_to1 - fee;
 
         let (firm_cut, platform_cut, pool_cut) = split_curve_fee_3way(
             fee,
@@ -2416,79 +2429,80 @@ pub mod firm {
             ctx.accounts.curve.pool_fee_bps,
             fee_bps,
         );
-        let challenge_key = ctx.accounts.curve.challenge;
-        let bump = [ctx.accounts.curve.bump];
 
-        // Pay the seller BEFORE mutating bookkeeping — mirrors `withdraw_pm_lp`'s pay-then-record
-        // order.
-        ctx.accounts.pay_seller(side, net_out, &challenge_key, &bump)?;
-
-        let curve = &mut ctx.accounts.curve;
-        match side {
+        let curve_inventory = &mut ctx.accounts.curve_inventory;
+        match from_side {
             PmSide::Pass => {
-                curve.pass_real = real_r.saturating_sub(gross);
-                curve.pass_shares = shares_outstanding.saturating_sub(shares_in);
+                curve_inventory.pass_shares = inv_from2;
+                curve_inventory.fail_shares = inv_to2;
             }
             PmSide::Fail => {
-                curve.fail_real = real_r.saturating_sub(gross);
-                curve.fail_shares = shares_outstanding.saturating_sub(shares_in);
+                curve_inventory.fail_shares = inv_from2;
+                curve_inventory.pass_shares = inv_to2;
             }
         }
+
+        let curve = &mut ctx.accounts.curve;
         curve.firm_fees_accrued = curve.firm_fees_accrued.saturating_add(firm_cut);
         curve.platform_fees_accrued = curve.platform_fees_accrued.saturating_add(platform_cut);
         curve.pool_fees_accrued = curve.pool_fees_accrued.saturating_add(pool_cut);
+        // Both totals shrink by exactly `fee` — verified by hand-trace to stay equal to each other.
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(fee);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(fee);
         let curve_key = curve.key();
 
         let position = &mut ctx.accounts.position;
-        match side {
-            PmSide::Pass => position.pass_shares = position.pass_shares.saturating_sub(shares_in),
-            PmSide::Fail => position.fail_shares = position.fail_shares.saturating_sub(shares_in),
+        match from_side {
+            PmSide::Pass => {
+                position.pass_shares = position.pass_shares.saturating_sub(amount_in);
+                position.fail_shares = position.fail_shares.checked_add(net_out).ok_or(FirmError::MathOverflow)?;
+            }
+            PmSide::Fail => {
+                position.fail_shares = position.fail_shares.saturating_sub(amount_in);
+                position.pass_shares = position.pass_shares.checked_add(net_out).ok_or(FirmError::MathOverflow)?;
+            }
         }
 
-        emit!(MarketSharesSold {
+        emit!(MarketSharesSwapped {
             curve: curve_key,
             holder: position.holder,
-            side,
-            shares_in,
-            collateral_out: net_out,
+            from_side,
+            amount_in,
+            amount_out: net_out,
             fee,
         });
         Ok(())
     }
 
-    /// Add permissionless liquidity depth to one side of a curve — NOT a purchase. No shares are
-    /// minted to the depositor; `amount` is pure reserve depth, credited to both the side's real
-    /// reserve and `curve.topup_deposited` (tracked separately from `pool_allocated` — see
-    /// `deallocate_pool_from_curve`'s doc comment for why that separation is the load-bearing
-    /// security property here). Because this widens `side_real` without touching the AMM's share
-    /// pool, it nudges that side's implied price UP slightly (the same direction `allocate_pool_to_curve`'s
-    /// deposits do) — an accepted quirk of pairing a real collateral leg with a notional share-supply
-    /// leg, not a bug.
+    /// Add permissionless liquidity depth to the curve's own AMM inventory — thin wrapper around
+    /// `split_collateral`'s exact mechanics, crediting `curve_inventory_position` instead of the
+    /// depositor's own position (so no shares are minted TO the depositor — this widens tradeable
+    /// depth, it is not a purchase). `amount` is tracked in `topup_deposited`, separately from
+    /// `pool_allocated` — see `deallocate_pool_from_curve`'s doc comment for why that separation is
+    /// the load-bearing security property here.
     ///
     /// The self-LP ban below is unconditional and the FIRST check in this handler — a trader funding
     /// their own market's curve is the single most important thing this instruction must never allow;
     /// skin-in-the-game flows only through the shared `PredictionMarketLpPool`, diversified across
     /// many traders' markets algorithmically.
-    pub fn add_curve_topup(ctx: Context<AddCurveTopup>, side: PmSide, amount: u64) -> Result<()> {
+    pub fn add_curve_topup(ctx: Context<AddCurveTopup>, amount: u64) -> Result<()> {
         require!(ctx.accounts.depositor.key() != ctx.accounts.curve.trader, FirmError::PmSelfLpBanned);
         require!(amount > 0, FirmError::ZeroAmount);
         require!(ctx.accounts.curve.status == PmCurveStatus::Open, FirmError::PmMarketNotOpen);
 
-        ctx.accounts.deposit(side, amount)?;
+        ctx.accounts.deposit(amount)?;
 
         let curve = &mut ctx.accounts.curve;
-        match side {
-            PmSide::Pass => curve.pass_real = curve.pass_real.saturating_add(amount),
-            PmSide::Fail => curve.fail_real = curve.fail_real.saturating_add(amount),
-        }
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_add(amount);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_add(amount);
         curve.topup_deposited = curve.topup_deposited.saturating_add(amount);
+        let curve_key = curve.key();
 
-        emit!(MarketCurveToppedUp {
-            curve: curve.key(),
-            depositor: ctx.accounts.depositor.key(),
-            side,
-            amount,
-        });
+        let inv = &mut ctx.accounts.curve_inventory;
+        inv.pass_shares = inv.pass_shares.saturating_add(amount);
+        inv.fail_shares = inv.fail_shares.saturating_add(amount);
+
+        emit!(MarketCurveToppedUp { curve: curve_key, depositor: ctx.accounts.depositor.key(), amount });
         Ok(())
     }
 
@@ -2520,11 +2534,10 @@ pub mod firm {
         Ok(())
     }
 
-    /// Escape hatch for an evaluation that never resolves. Settlement-authority-gated. PROVISIONAL —
-    /// the refund rule (`redeem_void_shares`, pro-rata against each side's OWN remaining real
-    /// reserve, no pooling across vaults) has not had founder/economics sign-off; see DEC-89 and
-    /// MASTER_ECONOMICS §22a. `redeem_shares`' pooled-across-both-vaults formula is specifically a
-    /// Pass/Fail winner-take-most-of-the-pot design — wrong here, since neither side "won."
+    /// Escape hatch for an evaluation that never resolves. Settlement-authority-gated. The refund
+    /// rule (`redeem_void_shares`'s flat 50/50, `pm_void_redeem_payout`) is no longer PROVISIONAL —
+    /// it replaced the old design's per-side pro-rata formula, which never got founder sign-off, with
+    /// one that has a hand-verified solvency proof (see that function's doc comment).
     pub fn void_market(ctx: Context<VoidMarketCurve>) -> Result<()> {
         require_market_curve_authority(&ctx.accounts.challenge, &ctx.accounts.firm_state)?;
         require!(
@@ -2542,190 +2555,220 @@ pub mod firm {
     /// Settlement is O(1) and moves no funds itself (`settle_market`); this is where funds actually
     /// move, one holder at a time, so no unbounded iteration over holders ever runs on-chain.
     ///
-    /// THE core formula (see `pm_redeem_payout`'s doc comment): 1:1 in the normal (well-funded) case,
-    /// a pro-rata haircut only under extreme imbalance — see DEC-89 / MASTER_ECONOMICS §22a for why
-    /// two independent CPMM legs (not a true complementary-outcome AMM) can fall short of full
-    /// backing. `redeemable_total`/`winning_shares_outstanding` are read fresh from `curve` on every
-    /// call and NEVER decremented by this instruction — every holder's payout is computed against the
-    /// SAME fixed pot regardless of redemption order, so no holder benefits from redeeming early (see
-    /// `RedeemMarketShares::pay`'s doc comment for the complementary reasoning on the PHYSICAL
-    /// draining side).
+    /// NO haircut formula — exact 1:1, always, by construction. The core invariant
+    /// (`total_pass_outstanding == total_fail_outstanding == collateral_vault.amount - fees_accrued`,
+    /// maintained by `split_collateral`/`merge_shares` being strictly 1:1 and `swap_curve_shares`
+    /// never touching `collateral_vault`) guarantees the vault always holds exactly the winning
+    /// side's total obligation. The defensive `.min(collateral_vault.amount)` in
+    /// `RedeemMarketShares::pay` is belt-and-suspenders against a hypothetical accounting bug, not a
+    /// sign this can routinely underpay — see `MarketCurve`'s struct comment for what's lost by not
+    /// having the old design's independent SPL-vault enforcement layer, and how this is mitigated.
     pub fn redeem_shares(ctx: Context<RedeemMarketShares>, holder: Pubkey) -> Result<()> {
         require!(ctx.accounts.curve.status == PmCurveStatus::Settled, FirmError::PmNotSettled);
         let outcome = ctx.accounts.curve.outcome.ok_or(FirmError::PmNotSettled)?;
 
-        let (winning_shares_outstanding, winning_position_shares) = match outcome {
-            PmSide::Pass => (ctx.accounts.curve.pass_shares, ctx.accounts.position.pass_shares),
-            PmSide::Fail => (ctx.accounts.curve.fail_shares, ctx.accounts.position.fail_shares),
+        let (winning_shares, losing_shares) = match outcome {
+            PmSide::Pass => (ctx.accounts.position.pass_shares, ctx.accounts.position.fail_shares),
+            PmSide::Fail => (ctx.accounts.position.fail_shares, ctx.accounts.position.pass_shares),
         };
-        require!(winning_position_shares > 0, FirmError::PmNothingToRedeem);
+        require!(winning_shares > 0, FirmError::PmNothingToRedeem);
 
-        let redeemable_total =
-            (ctx.accounts.curve.pass_real as u128).saturating_add(ctx.accounts.curve.fail_real as u128);
-        let payout = pm_redeem_payout(winning_position_shares, winning_shares_outstanding, redeemable_total);
+        ctx.accounts.pay(winning_shares)?;
 
-        let challenge_key = ctx.accounts.curve.challenge;
-        let bump = [ctx.accounts.curve.bump];
-        ctx.accounts.pay(payout, &challenge_key, &bump)?;
+        let curve = &mut ctx.accounts.curve;
+        match outcome {
+            PmSide::Pass => {
+                curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(winning_shares);
+                curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(losing_shares);
+            }
+            PmSide::Fail => {
+                curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(winning_shares);
+                curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(losing_shares);
+            }
+        }
 
         // Zero BOTH sides — not just the winning one — so the losing side's provably-worthless shares
-        // are cleared too and a second call always sees `winning_position_shares == 0`
-        // (`PmNothingToRedeem`), which is what stops a double-redeem.
+        // are cleared too and a second call always sees `winning_shares == 0` (`PmNothingToRedeem`),
+        // which is what stops a double-redeem.
         let position = &mut ctx.accounts.position;
         position.pass_shares = 0;
         position.fail_shares = 0;
 
-        emit!(MarketSharesRedeemed { curve: ctx.accounts.curve.key(), holder, side: outcome, payout });
+        emit!(MarketSharesRedeemed { curve: ctx.accounts.curve.key(), holder, side: outcome, payout: winning_shares });
         Ok(())
     }
 
-    /// `void_market`'s redemption leg — kept SEPARATE from `redeem_shares` rather than a status
-    /// branch inside it, because the formula is genuinely different, not a variant of the same one:
-    /// no pooling across vaults (a void has no winner), each side redeems against its OWN remaining
-    /// real reserve only. PROVISIONAL, same standing as `void_market` itself — see that instruction's
-    /// doc comment.
+    /// `void_market`'s redemption leg for ordinary holders — kept SEPARATE from `redeem_shares`
+    /// because the formula is genuinely different (flat 50/50, no winner), and separate from
+    /// `redeem_void_curve_inventory` because the curve's own inventory position needs its payout
+    /// routed back to the LP pool's escrow, not an ordinary `holder_firma` token account — see that
+    /// instruction's doc comment. Explicitly rejects `holder == curve.key()` so the two paths can
+    /// never be confused.
     pub fn redeem_void_shares(ctx: Context<RedeemVoidShares>, holder: Pubkey) -> Result<()> {
         require!(ctx.accounts.curve.status == PmCurveStatus::Void, FirmError::PmNotSettled);
+        require!(holder != ctx.accounts.curve.key(), FirmError::PmUseCurveInventoryRedemption);
 
-        let curve = &ctx.accounts.curve;
         let position = &ctx.accounts.position;
-        let pass_payout = pm_void_redeem_payout(position.pass_shares, curve.pass_shares, curve.pass_real);
-        let fail_payout = pm_void_redeem_payout(position.fail_shares, curve.fail_shares, curve.fail_real);
-        require!(pass_payout > 0 || fail_payout > 0, FirmError::PmNothingToRedeem);
+        let payout = pm_void_redeem_payout(position.pass_shares, position.fail_shares);
+        require!(payout > 0, FirmError::PmNothingToRedeem);
 
-        let challenge_key = curve.challenge;
-        let bump = [curve.bump];
-        ctx.accounts.pay(pass_payout, fail_payout, &challenge_key, &bump)?;
+        ctx.accounts.pay(payout)?;
+
+        let curve = &mut ctx.accounts.curve;
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(position.pass_shares);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(position.fail_shares);
 
         let position = &mut ctx.accounts.position;
         position.pass_shares = 0;
         position.fail_shares = 0;
 
-        emit!(MarketVoidRedeemed { curve: ctx.accounts.curve.key(), holder, pass_payout, fail_payout });
+        emit!(MarketVoidRedeemed { curve: ctx.accounts.curve.key(), holder, payout });
         Ok(())
     }
 
-    /// Move `amount` from the shared LP pool's escrow into this curve's two vaults, split in the
-    /// curve's CURRENT `pass_real : fail_real` ratio — falling back to the virtual-seed ratio when
-    /// the curve has never traded (both `*_real` still 0, which would otherwise divide by zero) — so
-    /// deepening liquidity never itself moves either leg's price disproportionately between the two
-    /// sides. PDA-signed by the POOL (the source). Keeper/settlement-authority-gated. Increments
-    /// `curve.pool_allocated` and `pool.total_drawn` (Phase 2's reserved field — this is what finally
-    /// uses it).
+    /// `void_market`'s redemption leg for the curve's OWN inventory position — kept as a dedicated
+    /// instruction rather than a conditional branch inside `redeem_void_shares` (Anchor account
+    /// structs are static; this keeps both paths simple, explicit, single-purpose instructions
+    /// instead of one instruction with runtime-conditional destinations, matching this file's
+    /// existing preference — e.g. `redeem_shares` vs. `redeem_void_shares` themselves). Pays directly
+    /// into `pool_escrow_vault` and updates `pool.pool_allocated`/`pool.total_returned` in the SAME
+    /// instruction — otherwise the payout would land in a token account owned by the curve PDA,
+    /// disconnected from `PredictionMarketLpPool`'s own accounting. Permissionless crank.
+    pub fn redeem_void_curve_inventory(ctx: Context<RedeemVoidCurveInventory>) -> Result<()> {
+        require!(ctx.accounts.curve.status == PmCurveStatus::Void, FirmError::PmNotSettled);
+
+        let inv = &ctx.accounts.curve_inventory;
+        let payout = pm_void_redeem_payout(inv.pass_shares, inv.fail_shares);
+        require!(payout > 0, FirmError::PmNothingToRedeem);
+
+        ctx.accounts.pay(payout)?;
+
+        let curve = &mut ctx.accounts.curve;
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(inv.pass_shares);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(inv.fail_shares);
+        let curve_key = curve.key();
+
+        let inv = &mut ctx.accounts.curve_inventory;
+        inv.pass_shares = 0;
+        inv.fail_shares = 0;
+
+        let pool = &mut ctx.accounts.pm_lp_pool;
+        pool.total_returned = pool.total_returned.saturating_add(payout);
+        // `pool_allocated` also reconciles here — whatever was still allocated to this now-void curve
+        // has definitionally come back (there is no other exit path for it once a market voids).
+        let curve = &mut ctx.accounts.curve;
+        curve.pool_allocated = 0;
+
+        emit!(MarketVoidCurveInventoryRedeemed { curve: curve_key, firm: pool.firm, payout });
+        Ok(())
+    }
+
+    /// Move `amount` of real collateral from the shared LP pool's escrow into this curve's own AMM
+    /// inventory — thin wrapper around `split_collateral`'s mechanics, crediting
+    /// `curve_inventory_position` instead of an external depositor's position. Genuine two-sided
+    /// market-making inventory, not a ratio-weighted split across independent legs (the old design's
+    /// `pm_pool_ratio_split` — gone, since there's only one collateral vault now). PDA-signed by the
+    /// POOL (the source). Keeper/settlement-authority-gated. Increments `curve.pool_allocated` and
+    /// `pool.total_drawn`.
     pub fn allocate_pool_to_curve(ctx: Context<AllocatePoolToCurve>, amount: u64) -> Result<()> {
         require_market_curve_authority(&ctx.accounts.challenge, &ctx.accounts.firm_state)?;
         require!(amount > 0, FirmError::ZeroAmount);
-        // PM2-ALLOC-RACE-1 (2026-08-06 adversarial audit): unlike `deallocate_pool_from_curve` (whose
-        // doc comment explicitly discloses "nothing blocks a Locked/Settled curve" as an accepted
-        // residual), fresh allocation into an already-Locked/Settled curve was undisclosed and, worse,
-        // realistically reachable without any compromise: the off-chain allocator keeper computes its
-        // allocation decisions from `PredictionMarketEligibility` on its own periodic tick, with no read
-        // of the curve's on-chain status, so a market that settles between two ticks could have pool
-        // capital land AFTER the outcome is already known — directly inflating the known winner's
-        // redemption pot at the pool's expense. Gated here the same way `buy_shares`/`sell_shares`/
+        // PM2-ALLOC-RACE-1 (2026-08-06 adversarial audit, carried forward into this redesign):
+        // fresh allocation into an already-Locked/Settled curve is realistically reachable without
+        // any compromise — the off-chain allocator keeper computes its allocation decisions from
+        // `PredictionMarketEligibility` on its own periodic tick, with no read of the curve's on-chain
+        // status, so a market that settles between two ticks could have pool capital land AFTER the
+        // outcome is already known. Gated here the same way `split_collateral`/`swap_curve_shares`/
         // `add_curve_topup` already gate on `Open`.
         require!(ctx.accounts.curve.status == PmCurveStatus::Open, FirmError::PmMarketNotOpen);
 
-        let curve = &ctx.accounts.curve;
-        let (pass_w, fail_w) = if curve.pass_real == 0 && curve.fail_real == 0 {
-            (curve.pass_virtual, curve.fail_virtual)
-        } else {
-            (curve.pass_real, curve.fail_real)
-        };
-        let (to_pass, to_fail) = pm_pool_ratio_split(amount, pass_w, fail_w);
-
-        ctx.accounts.disburse(to_pass, to_fail)?;
+        ctx.accounts.disburse(amount)?;
 
         let curve = &mut ctx.accounts.curve;
-        curve.pass_real = curve.pass_real.saturating_add(to_pass);
-        curve.fail_real = curve.fail_real.saturating_add(to_fail);
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_add(amount);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_add(amount);
         curve.pool_allocated = curve.pool_allocated.saturating_add(amount);
         let curve_key = curve.key();
+
+        let inv = &mut ctx.accounts.curve_inventory;
+        inv.pass_shares = inv.pass_shares.saturating_add(amount);
+        inv.fail_shares = inv.fail_shares.saturating_add(amount);
 
         let pool = &mut ctx.accounts.pm_lp_pool;
         pool.total_drawn = pool.total_drawn.saturating_add(amount);
 
-        emit!(PmCurveAllocated { curve: curve_key, firm: pool.firm, amount, to_pass, to_fail });
+        emit!(PmCurveAllocated { curve: curve_key, firm: pool.firm, amount });
         Ok(())
     }
 
-    /// The symmetric reverse of `allocate_pool_to_curve` — moves capital back from a curve's vaults
-    /// to the shared LP pool's escrow, same ratio-preserving split against the curve's CURRENT
-    /// reserve ratio. Keeper/settlement-authority-gated.
+    /// The symmetric reverse of `allocate_pool_to_curve` — moves `amount` of real collateral back
+    /// from the curve's own inventory to the shared LP pool's escrow (a merge crediting the pool
+    /// instead of an external holder). Keeper/settlement-authority-gated. TWO guards, both required:
     ///
     /// `require!(amount <= curve.pool_allocated, ...)` is the hard on-chain ceiling that stops even a
     /// COMPROMISED keeper authority from ever clawing back a permissionless top-up depositor's own
     /// contribution: `pool_allocated` (pool-sourced) and `topup_deposited` (depositor-sourced) are two
-    /// separately-tracked fields specifically so this check is possible — deallocation can only ever
-    /// pull back what the pool itself put in, never more, regardless of how much `topup_deposited`
-    /// would otherwise "cover."
+    /// separately-tracked fields specifically so this check is possible.
     ///
-    /// Residual risk, flagged not silently patched: nothing here blocks deallocating from a `Locked`
-    /// or `Settled` curve. A keeper draining pool capital after `settle_market` shrinks `pass_real`/
-    /// `fail_real` — the exact inputs `redeem_shares`' `redeemable_total` reads live at EVERY
-    /// redemption call — so a deallocation squeezed in between two redemptions could under-fund a
-    /// later holder's payout relative to what an earlier holder already collected. Not gated here
-    /// because this phase's spec names exactly one required guard (the ceiling above); leaving this
-    /// open for the reviewer rather than inventing an un-requested status gate on genuinely new
-    /// money-movement logic.
+    /// `require!(amount <= min(curve_inventory.pass_shares, curve_inventory.fail_shares), ...)` is NEW
+    /// for this redesign (curve inventory naturally becomes asymmetric from ordinary permissionless
+    /// swapping — that's intended AMM behavior, reserves diverge from 50/50 as trades flow one way) —
+    /// restricts the pool to reclaiming only the still-MATCHED portion of inventory, leaving any
+    /// traded-away imbalance as swap-liquidity backing. Low-severity, disclosed-not-blocking griefing
+    /// note: a permissionless swap could front-run a scheduled deallocate to shrink this minimum and
+    /// force a keeper retry — costs the adversary real trading fees, gains nothing, not a fund-safety
+    /// issue, same disclosure standing as `PM2-ALLOC-RACE-1`.
+    ///
+    /// Residual risk, flagged not silently patched (carried forward from the old design): nothing
+    /// here blocks deallocating from a `Locked`/`Settled` curve. Left open for the same reason the old
+    /// design left it open — this phase's spec names exactly the two guards above.
     pub fn deallocate_pool_from_curve(ctx: Context<DeallocatePoolFromCurve>, amount: u64) -> Result<()> {
         require_market_curve_authority(&ctx.accounts.challenge, &ctx.accounts.firm_state)?;
         require!(amount > 0, FirmError::ZeroAmount);
         require!(amount <= ctx.accounts.curve.pool_allocated, FirmError::PmExceedsPoolAllocation);
+        require!(
+            amount <= ctx.accounts.curve_inventory.pass_shares.min(ctx.accounts.curve_inventory.fail_shares),
+            FirmError::PmExceedsCurveInventory
+        );
 
-        let curve = &ctx.accounts.curve;
-        let (pass_w, fail_w) = if curve.pass_real == 0 && curve.fail_real == 0 {
-            (curve.pass_virtual, curve.fail_virtual)
-        } else {
-            (curve.pass_real, curve.fail_real)
-        };
-        let (from_pass_target, from_fail_target) = pm_pool_ratio_split(amount, pass_w, fail_w);
-        // Never claim more than a leg's actual real reserve (defensive — `pool_allocated <=
-        // pass_real + fail_real` should always hold, but this keeps the transfer amounts honest even
-        // if it doesn't).
-        let from_pass = from_pass_target.min(curve.pass_real);
-        let from_fail = amount.saturating_sub(from_pass).min(curve.fail_real);
-        let _ = from_fail_target; // superseded by the defensive `.min()` above
-
-        let challenge_key = curve.challenge;
-        let bump = [curve.bump];
-        ctx.accounts.withdraw(from_pass, from_fail, &challenge_key, &bump)?;
+        ctx.accounts.withdraw(amount)?;
 
         let curve = &mut ctx.accounts.curve;
-        curve.pass_real = curve.pass_real.saturating_sub(from_pass);
-        curve.fail_real = curve.fail_real.saturating_sub(from_fail);
+        curve.total_pass_outstanding = curve.total_pass_outstanding.saturating_sub(amount);
+        curve.total_fail_outstanding = curve.total_fail_outstanding.saturating_sub(amount);
         curve.pool_allocated = curve.pool_allocated.saturating_sub(amount);
         let curve_key = curve.key();
+
+        let inv = &mut ctx.accounts.curve_inventory;
+        inv.pass_shares = inv.pass_shares.saturating_sub(amount);
+        inv.fail_shares = inv.fail_shares.saturating_sub(amount);
 
         let pool = &mut ctx.accounts.pm_lp_pool;
         pool.total_returned = pool.total_returned.saturating_add(amount);
 
-        emit!(PmCurveDeallocated { curve: curve_key, firm: pool.firm, amount, from_pass, from_fail });
+        emit!(PmCurveDeallocated { curve: curve_key, firm: pool.firm, amount });
         Ok(())
     }
 
     /// Permissionless crank (typically a keeper on a schedule) — moves `curve.pool_fees_accrued` real
-    /// $FIRMA from wherever it's sitting in the curve's two vaults into the LP pool's yield vault,
-    /// then folds it into `yield_acc` via `fold_yield` — same "fold what arrived, retain in
-    /// `unallocated_yield` if nothing's staked yet" idiom `sync_firma_yield`/`sync_backstop_firma_yield`
-    /// already use. No signer identity check at all — same permission shape as those two (mirrors
-    /// `SyncBackstopFirmaYield`'s Accounts struct exactly: no `Signer` field bound to any identity).
-    /// Differs from them only in that the swept amount comes from a live accrual FIELD this program
-    /// already tracks precisely, not a vault-balance delta against an external, untrusted depositor.
+    /// $FIRMA from `collateral_vault` into the LP pool's yield vault, then folds it into `yield_acc`
+    /// via `fold_yield` — same "fold what arrived, retain in `unallocated_yield` if nothing's staked
+    /// yet" idiom `sync_firma_yield`/`sync_backstop_firma_yield` already use. No signer identity check
+    /// at all — same permission shape as those two. Simpler than the old design (one vault, not two,
+    /// so no per-vault split needed).
     pub fn sweep_curve_fees_to_pool(ctx: Context<SweepCurveFeesToPool>) -> Result<()> {
         let amount = ctx.accounts.curve.pool_fees_accrued;
         if amount == 0 {
             return Ok(());
         }
-        let from_pass = amount.min(ctx.accounts.pass_vault.amount);
-        let from_fail = amount.saturating_sub(from_pass).min(ctx.accounts.fail_vault.amount);
+        let amount = amount.min(ctx.accounts.collateral_vault.amount);
 
         let challenge_key = ctx.accounts.curve.challenge;
         let bump = [ctx.accounts.curve.bump];
-        ctx.accounts.sweep(from_pass, from_fail, &challenge_key, &bump)?;
+        ctx.accounts.sweep(amount, &challenge_key, &bump)?;
 
         let curve = &mut ctx.accounts.curve;
-        curve.pool_fees_accrued = 0;
+        curve.pool_fees_accrued = curve.pool_fees_accrued.saturating_sub(amount);
         let curve_key = curve.key();
 
         let pool = &mut ctx.accounts.pm_lp_pool;
@@ -4687,16 +4730,10 @@ pub const DEFAULT_PM_LP_ALLOCATION_CAP_BPS: u16 = 8000; // 80%
 /// fresh each call) that `withdraw_pm_lp` may pay out across all stakers combined per rolling UTC day.
 pub const PM_LP_DAILY_OUTFLOW_CAP_BPS: u16 = 1000; // 10%
 
-/// PM-CURVE-SUPPLY-1 (PROVISIONAL, needs DEC-89 sign-off): each `MarketCurve` leg's notional "share
-/// supply" — the pool `buy_output`/`sell_output` sell down — expressed as a multiple of that leg's own
-/// virtual seed. `MarketCurve.pass_shares`/`fail_shares` store shares OUTSTANDING (held by position
-/// holders — `redeem_shares`' pro-rata math needs that semantic, not "remaining unsold supply"); the
-/// AMM math needs the OPPOSITE quantity, so `pm_curve_available_shares` derives it as the complement:
-/// `virtual_seed * MULTIPLIER - shares_outstanding`. MULTIPLIER=2 starts each independent leg at a 50%
-/// implied price (`virtual / (2 × virtual)`) — enough headroom under the price-ceiling guard for the
-/// very first buy to succeed (MULTIPLIER=1 would start a leg already AT the $1 ceiling, permanently
-/// frozen — every buy strictly raises price, so a market that opens at the ceiling can never trade).
-pub const PM_CURVE_SHARE_SUPPLY_MULTIPLIER: u64 = 2;
+// PM_CURVE_SHARE_SUPPLY_MULTIPLIER (the old two-independent-leg design's notional-supply constant)
+// was removed 2026-08-06 when `MarketCurve` moved to a real split/merge/swap design — see this
+// file's "Prediction Market Curve" section header comment for why, and DEC-89 for the decision
+// record. The new design's curve inventory holds real (not notional) shares directly.
 
 // Dynamic LP thresholds on the REAL pool reserve, now in **lamports** (wSOL, 9 dp) — the curve reserve
 // is wSOL post-migration (§17). SOL MIGRATION (oracle-free, Phase 3+4): dimensionally lamports vs the
@@ -5547,26 +5584,15 @@ fn required_pm_lp_cooldown(effective_tier: u8, share_bps: u64) -> i64 {
     pm_lp_cooldown(effective_tier).saturating_mul(pm_lp_whale_multiplier_tenths(share_bps) as i64) / 10
 }
 
-// ───────── Prediction Market Curve (Phase 3 pooled-LP AMM plan) helpers ─────────
-// Pure functions so the round-trip/ceiling/redemption invariants can be unit-tested directly against
-// the exact arithmetic the handlers use, same discipline as `fold_yield`/`pending_yield`/`pro_rata`
-// above and `bonding_curve`'s own `buy_output`/`sell_output` tests.
+// ───────── Prediction Market Curve (split/merge/swap CTF-style design, 2026-08-06) helpers ─────────
+// Pure functions so the fee/void-payout invariants can be unit-tested directly against the exact
+// arithmetic the handlers use, same discipline as `fold_yield`/`pending_yield`/`pro_rata` above and
+// `bonding_curve`'s own `buy_output`/`sell_output` tests.
 
-/// `MarketCurve` PDA signer seeds (authority over both `pass_vault`/`fail_vault`). Mirrors
+/// `MarketCurve` PDA signer seeds (authority over `collateral_vault`). Mirrors
 /// `pm_lp_signer`/`bonding_curve::curve_signer`.
 fn pm_curve_signer<'a>(challenge: &'a Pubkey, bump: &'a [u8; 1]) -> [&'a [u8]; 3] {
     [b"pm_curve", challenge.as_ref(), bump]
-}
-
-/// The curve's own sellable/buyable reserve for one leg's CPMM math — the `firma_reserve` argument
-/// `bonding_curve::buy_output`/`sell_output` expect, mirroring `bonding_curve.firma_reserve`'s
-/// shrink-on-buy/grow-on-sell behaviour exactly. See `PM_CURVE_SHARE_SUPPLY_MULTIPLIER`'s doc comment
-/// for why this is the complement of, not equal to, the stored `pass_shares`/`fail_shares` field
-/// (which tracks the opposite quantity: shares OUTSTANDING, for `redeem_shares`' pro-rata math).
-fn pm_curve_available_shares(virtual_seed: u64, shares_outstanding: u64) -> u64 {
-    virtual_seed
-        .saturating_mul(PM_CURVE_SHARE_SUPPLY_MULTIPLIER)
-        .saturating_sub(shares_outstanding)
 }
 
 /// Split a curve trade's fee three ways (firm / platform / pool), floored, with the remainder (pure
@@ -5593,48 +5619,17 @@ fn split_curve_fee_3way(
     (firm_cut, platform_cut, pool_cut)
 }
 
-/// `redeem_shares`' core payout formula (PM-CURVE-REDEEM-1): 1:1 in the normal (well-funded) case, a
-/// pro-rata haircut only under extreme imbalance. `redeemable_total` pools BOTH vaults (`pass_real +
-/// fail_real`) because two independent CPMM legs (plan judgment call #2, not a true
-/// complementary-outcome AMM) mean total collateral collected can fall short of shares outstanding —
-/// this caps at solvency instead of assuming an exact 1:1. See DEC-89 / MASTER_ECONOMICS §22a.
-/// F-I-9 discipline: u128 intermediate, saturating, floors toward the protocol (R40 convention).
-fn pm_redeem_payout(position_shares: u64, shares_outstanding: u64, redeemable_total: u128) -> u64 {
-    if shares_outstanding == 0 {
-        return 0;
-    }
-    if redeemable_total >= shares_outstanding as u128 {
-        position_shares // true 1:1, capped — never more than this holder actually holds
-    } else {
-        ((position_shares as u128).saturating_mul(redeemable_total) / shares_outstanding as u128) as u64
-    }
-}
-
-/// `redeem_void_shares`' per-side pro-rata formula. Unlike `pm_redeem_payout`, NO pooling across
-/// vaults — a void market has no winner, so PASS holders split `pass_real` among themselves by their
-/// share of `pass_shares` outstanding, and FAIL holders separately split `fail_real`. PROVISIONAL —
-/// see `void_market`'s doc comment (needs DEC-89 sign-off before ship).
-fn pm_void_redeem_payout(position_side_shares: u64, side_shares_outstanding: u64, side_real: u64) -> u64 {
-    if side_shares_outstanding == 0 {
-        return 0;
-    }
-    ((position_side_shares as u128).saturating_mul(side_real as u128) / side_shares_outstanding as u128) as u64
-}
-
-/// Split `amount` between the two legs in proportion to `(pass_weight, fail_weight)` — used by
-/// `allocate_pool_to_curve`/`deallocate_pool_from_curve` with the curve's CURRENT `(pass_real,
-/// fail_real)` as the weights, or — when both are still 0 (a curve that has never traded) — the
-/// virtual seeds instead, so a depth change never itself moves either leg's price. `fail`'s share
-/// absorbs the rounding remainder (arbitrary but consistent, mirrors `split_fee`'s "one leg takes the
-/// dust" convention).
-fn pm_pool_ratio_split(amount: u64, pass_weight: u64, fail_weight: u64) -> (u64, u64) {
-    let total = (pass_weight as u128).saturating_add(fail_weight as u128);
-    if total == 0 {
-        let half = amount / 2;
-        return (amount - half, half);
-    }
-    let to_pass = ((amount as u128).saturating_mul(pass_weight as u128) / total) as u64;
-    (to_pass, amount.saturating_sub(to_pass))
+/// `redeem_void_shares`' payout formula (PM-CTF-VOID-1, 2026-08-06 — replaces the old per-side
+/// pro-rata formula, which was PROVISIONAL and never got founder sign-off): a void market has no
+/// winner, so every position (including the curve's own inventory — see `redeem_void_curve_inventory`)
+/// redeems at a flat 50/50 — `floor((pass_shares + fail_shares) / 2)`. Proof this can never exceed
+/// `collateral_vault`'s real balance: `Σ floor((Pᵢ+Fᵢ)/2) ≤ Σ(Pᵢ+Fᵢ)/2 = (ΣPᵢ+ΣFᵢ)/2 = (C+C)/2 = C`
+/// (using the core invariant `ΣPᵢ = ΣFᵢ = C`, `C` = total collateral ever split and not yet merged).
+/// Floor-rounding dust (at most 1 unit per odd-sum position) is safely retained in `collateral_vault`,
+/// swept to platform fees rather than silently stranded — same "one leg absorbs the remainder"
+/// convention as `split_curve_fee_3way` above. F-I-9 discipline: u128 intermediate, saturating.
+fn pm_void_redeem_payout(pass_shares: u64, fail_shares: u64) -> u64 {
+    ((pass_shares as u128).saturating_add(fail_shares as u128) / 2) as u64
 }
 
 /// Decode a persisted `RiskTier` discriminant (e.g. `QueuedPayout.settlement_tier`).
@@ -9092,7 +9087,7 @@ impl<'info> ClaimPmLpYield<'info> {
     }
 }
 
-// ───────── Prediction Market Curve (Phase 3 pooled-LP AMM plan) ─────────
+// ───────── Prediction Market Curve (split/merge/swap CTF-style design, 2026-08-06) ─────────
 // Accounts are Box'd throughout to keep the BPF stack frame under 4 KB, same discipline as every
 // other instruction in this file.
 
@@ -9139,19 +9134,25 @@ pub struct InitMarketCurve<'info> {
         payer = authority,
         token::mint = firma_mint,
         token::authority = curve,
-        seeds = [b"pm_curve_pass", challenge.key().as_ref()],
+        seeds = [b"pm_curve_collateral", challenge.key().as_ref()],
         bump
     )]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+
+    /// The curve's own AMM inventory — a `MarketPosition` owned by the curve's OWN PDA, created
+    /// eagerly here (not lazily) so every later instruction that reads it is a plain `mut` +
+    /// `address =` check. Seeded on `curve.key()` TWICE (both the "curve" and "holder" slots) —
+    /// sound even though `curve` is being initialized in this same instruction, since `curve`'s
+    /// address is fully determined by its OWN seeds (`[b"pm_curve", challenge]`), not by whether it
+    /// already exists on-chain.
     #[account(
         init,
         payer = authority,
-        token::mint = firma_mint,
-        token::authority = curve,
-        seeds = [b"pm_curve_fail", challenge.key().as_ref()],
+        space = 8 + MarketPosition::INIT_SPACE,
+        seeds = [b"pm_position", curve.key().as_ref(), curve.key().as_ref()],
         bump
     )]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    pub curve_inventory_position: Box<Account<'info, MarketPosition>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -9159,50 +9160,43 @@ pub struct InitMarketCurve<'info> {
 }
 
 #[derive(Accounts)]
-pub struct BuyMarketShares<'info> {
+pub struct SplitCollateral<'info> {
     #[account(mut)]
-    pub buyer: Signer<'info>,
+    pub depositor: Signer<'info>,
 
     #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
 
+    /// Self-only — seeded on the depositor's OWN key, no delegate/beneficiary parameter (closes a
+    /// wallet-clustering gap an adversarial review flagged for a genericized version of this).
     #[account(
         init_if_needed,
-        payer = buyer,
+        payer = depositor,
         space = 8 + MarketPosition::INIT_SPACE,
-        seeds = [b"pm_position", curve.key().as_ref(), buyer.key().as_ref()],
+        seeds = [b"pm_position", curve.key().as_ref(), depositor.key().as_ref()],
         bump
     )]
     pub position: Box<Account<'info, MarketPosition>>,
 
-    #[account(mut, token::mint = curve.firma_mint, token::authority = buyer)]
-    pub buyer_firma: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = curve.firma_mint, token::authority = depositor)]
+    pub depositor_firma: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
-impl<'info> BuyMarketShares<'info> {
-    /// Move the buyer's gross collateral (including the fee — the fee stays inside the vault,
-    /// tracked separately via the `*_fees_accrued` fields rather than transferred out) into whichever
-    /// side's vault this buy targets. Buyer-authority transfer (money coming IN), not PDA-signed.
-    fn transfer_collateral_in(&self, side: PmSide, amount: u64) -> Result<()> {
-        let to = match side {
-            PmSide::Pass => self.pass_vault.to_account_info(),
-            PmSide::Fail => self.fail_vault.to_account_info(),
-        };
+impl<'info> SplitCollateral<'info> {
+    fn deposit(&self, amount: u64) -> Result<()> {
         token::transfer(
             CpiContext::new(
                 self.token_program.to_account_info(),
                 anchor_spl::token::Transfer {
-                    from: self.buyer_firma.to_account_info(),
-                    to,
-                    authority: self.buyer.to_account_info(),
+                    from: self.depositor_firma.to_account_info(),
+                    to: self.collateral_vault.to_account_info(),
+                    authority: self.depositor.to_account_info(),
                 },
             ),
             amount,
@@ -9211,49 +9205,39 @@ impl<'info> BuyMarketShares<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SellMarketShares<'info> {
-    pub seller: Signer<'info>,
+pub struct MergeShares<'info> {
+    pub depositor: Signer<'info>,
 
     #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
-        seeds = [b"pm_position", curve.key().as_ref(), seller.key().as_ref()],
+        seeds = [b"pm_position", curve.key().as_ref(), depositor.key().as_ref()],
         bump = position.bump,
-        constraint = position.holder == seller.key() @ FirmError::Unauthorized,
+        constraint = position.holder == depositor.key() @ FirmError::Unauthorized,
     )]
     pub position: Box<Account<'info, MarketPosition>>,
 
-    #[account(mut, token::mint = curve.firma_mint, token::authority = seller)]
-    pub seller_firma: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = curve.firma_mint, token::authority = depositor)]
+    pub depositor_firma: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
 
-impl<'info> SellMarketShares<'info> {
-    /// PDA-signed payout FROM the side's vault TO the seller — money going OUT, unlike
-    /// `buy_shares`' buyer-authority transfer in.
-    fn pay_seller(&self, side: PmSide, amount: u64, challenge: &Pubkey, bump: &[u8; 1]) -> Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        let seeds = pm_curve_signer(challenge, bump);
-        let from = match side {
-            PmSide::Pass => self.pass_vault.to_account_info(),
-            PmSide::Fail => self.fail_vault.to_account_info(),
-        };
+impl<'info> MergeShares<'info> {
+    fn pay(&self, amount: u64) -> Result<()> {
+        let bump = [self.curve.bump];
+        let seeds = pm_curve_signer(&self.curve.challenge, &bump);
         token::transfer(
             CpiContext::new_with_signer(
                 self.token_program.to_account_info(),
                 anchor_spl::token::Transfer {
-                    from,
-                    to: self.seller_firma.to_account_info(),
+                    from: self.collateral_vault.to_account_info(),
+                    to: self.depositor_firma.to_account_info(),
                     authority: self.curve.to_account_info(),
                 },
                 &[&seeds],
@@ -9264,16 +9248,38 @@ impl<'info> SellMarketShares<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SwapCurveShares<'info> {
+    pub signer: Signer<'info>,
+
+    #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
+    pub curve: Box<Account<'info, MarketCurve>>,
+
+    /// The curve's own AMM inventory — no collateral moves in this instruction at all, so no vault
+    /// account is needed here, only this and the two `MarketPosition`s.
+    #[account(mut, address = curve.curve_inventory_position)]
+    pub curve_inventory: Box<Account<'info, MarketPosition>>,
+
+    #[account(
+        mut,
+        seeds = [b"pm_position", curve.key().as_ref(), signer.key().as_ref()],
+        bump = position.bump,
+        constraint = position.holder == signer.key() @ FirmError::Unauthorized,
+    )]
+    pub position: Box<Account<'info, MarketPosition>>,
+}
+
+#[derive(Accounts)]
 pub struct AddCurveTopup<'info> {
     pub depositor: Signer<'info>,
 
     #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, address = curve.curve_inventory_position)]
+    pub curve_inventory: Box<Account<'info, MarketPosition>>,
 
     #[account(mut, token::mint = curve.firma_mint, token::authority = depositor)]
     pub depositor_firma: Box<Account<'info, TokenAccount>>,
@@ -9282,17 +9288,13 @@ pub struct AddCurveTopup<'info> {
 }
 
 impl<'info> AddCurveTopup<'info> {
-    fn deposit(&self, side: PmSide, amount: u64) -> Result<()> {
-        let to = match side {
-            PmSide::Pass => self.pass_vault.to_account_info(),
-            PmSide::Fail => self.fail_vault.to_account_info(),
-        };
+    fn deposit(&self, amount: u64) -> Result<()> {
         token::transfer(
             CpiContext::new(
                 self.token_program.to_account_info(),
                 anchor_spl::token::Transfer {
                     from: self.depositor_firma.to_account_info(),
-                    to,
+                    to: self.collateral_vault.to_account_info(),
                     authority: self.depositor.to_account_info(),
                 },
             ),
@@ -9389,13 +9391,11 @@ pub struct RedeemMarketShares<'info> {
     /// below (not this signer) determine who actually gets paid.
     pub payer: Signer<'info>,
 
-    #[account(seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
+    #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -9418,51 +9418,29 @@ pub struct RedeemMarketShares<'info> {
 }
 
 impl<'info> RedeemMarketShares<'info> {
-    /// Splits `amount` across the two vaults by LIVE balance — pass first, fail for the remainder.
-    /// Which vault a given lamport physically comes from is not economically meaningful (both back
-    /// the same pooled `redeemable_total`, which is never decremented — see `redeem_shares`' doc
-    /// comment for why that matters for fairness across multiple redeemers); this ordering only needs
-    /// to never claim more than a vault actually holds, which `.min()` + remainder guarantees. The
-    /// GLOBAL total every `redeem_shares` call can ever draw, summed across all holders, is bounded by
-    /// `pm_redeem_payout`'s own math at <= `redeemable_total` — strictly less than each vault's real
-    /// balance plus its own un-swept fee dust — so this can never encroach on `*_fees_accrued`
-    /// (`sweep_curve_fees_to_pool`'s money) in aggregate, regardless of per-vault draining order.
-    fn pay(&self, amount: u64, challenge: &Pubkey, bump: &[u8; 1]) -> Result<()> {
+    /// Exact 1:1 from the single shared `collateral_vault` — no cross-vault split needed anymore
+    /// (only one vault exists). The `.min()` is defensive belt-and-suspenders (see `redeem_shares`'
+    /// doc comment for why the invariant should make this a no-op in correct operation), not a sign
+    /// this routinely underpays.
+    fn pay(&self, amount: u64) -> Result<()> {
         if amount == 0 {
             return Ok(());
         }
-        let from_pass = amount.min(self.pass_vault.amount);
-        let from_fail = amount.saturating_sub(from_pass).min(self.fail_vault.amount);
-        let seeds = pm_curve_signer(challenge, bump);
-        if from_pass > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.pass_vault.to_account_info(),
-                        to: self.holder_firma.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_pass,
-            )?;
-        }
-        if from_fail > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.fail_vault.to_account_info(),
-                        to: self.holder_firma.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_fail,
-            )?;
-        }
-        Ok(())
+        let amount = amount.min(self.collateral_vault.amount);
+        let bump = [self.curve.bump];
+        let seeds = pm_curve_signer(&self.curve.challenge, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.collateral_vault.to_account_info(),
+                    to: self.holder_firma.to_account_info(),
+                    authority: self.curve.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
     }
 }
 
@@ -9471,13 +9449,11 @@ impl<'info> RedeemMarketShares<'info> {
 pub struct RedeemVoidShares<'info> {
     pub payer: Signer<'info>,
 
-    #[account(seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
+    #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -9498,41 +9474,76 @@ pub struct RedeemVoidShares<'info> {
 }
 
 impl<'info> RedeemVoidShares<'info> {
-    /// Unlike `RedeemMarketShares::pay`, each side pays ONLY from its own vault — no cross-vault
-    /// fallback — mirroring `pm_void_redeem_payout`'s no-pooling formula exactly.
-    fn pay(&self, pass_payout: u64, fail_payout: u64, challenge: &Pubkey, bump: &[u8; 1]) -> Result<()> {
-        let seeds = pm_curve_signer(challenge, bump);
-        let from_pass = pass_payout.min(self.pass_vault.amount);
-        if from_pass > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.pass_vault.to_account_info(),
-                        to: self.holder_firma.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_pass,
-            )?;
+    fn pay(&self, amount: u64) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
         }
-        let from_fail = fail_payout.min(self.fail_vault.amount);
-        if from_fail > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.fail_vault.to_account_info(),
-                        to: self.holder_firma.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_fail,
-            )?;
+        let amount = amount.min(self.collateral_vault.amount);
+        let bump = [self.curve.bump];
+        let seeds = pm_curve_signer(&self.curve.challenge, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.collateral_vault.to_account_info(),
+                    to: self.holder_firma.to_account_info(),
+                    authority: self.curve.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
+    }
+}
+
+#[derive(Accounts)]
+pub struct RedeemVoidCurveInventory<'info> {
+    /// Permissionless cranker.
+    pub payer: Signer<'info>,
+
+    #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
+    pub curve: Box<Account<'info, MarketCurve>>,
+
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, address = curve.curve_inventory_position)]
+    pub curve_inventory: Box<Account<'info, MarketPosition>>,
+
+    #[account(
+        mut,
+        seeds = [b"pm_lp_pool", curve.firm.as_ref()],
+        bump = pm_lp_pool.bump,
+        constraint = pm_lp_pool.firm == curve.firm @ FirmError::Unauthorized,
+    )]
+    pub pm_lp_pool: Box<Account<'info, PredictionMarketLpPool>>,
+
+    #[account(mut, address = pm_lp_pool.escrow_vault)]
+    pub pool_escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> RedeemVoidCurveInventory<'info> {
+    fn pay(&self, amount: u64) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
         }
-        Ok(())
+        let amount = amount.min(self.collateral_vault.amount);
+        let bump = [self.curve.bump];
+        let seeds = pm_curve_signer(&self.curve.challenge, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.collateral_vault.to_account_info(),
+                    to: self.pool_escrow_vault.to_account_info(),
+                    authority: self.curve.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
     }
 }
 
@@ -9562,10 +9573,11 @@ pub struct AllocatePoolToCurve<'info> {
     #[account(mut, seeds = [b"pm_curve", challenge.key().as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, address = curve.curve_inventory_position)]
+    pub curve_inventory: Box<Account<'info, MarketPosition>>,
 
     #[account(
         mut,
@@ -9583,38 +9595,21 @@ pub struct AllocatePoolToCurve<'info> {
 
 impl<'info> AllocatePoolToCurve<'info> {
     /// PDA-signed by the POOL (the source of this transfer).
-    fn disburse(&self, to_pass: u64, to_fail: u64) -> Result<()> {
+    fn disburse(&self, amount: u64) -> Result<()> {
         let bump = [self.pm_lp_pool.bump];
         let seeds = pm_lp_signer(&self.pm_lp_pool.firm, &bump);
-        if to_pass > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.pool_escrow_vault.to_account_info(),
-                        to: self.pass_vault.to_account_info(),
-                        authority: self.pm_lp_pool.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                to_pass,
-            )?;
-        }
-        if to_fail > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.pool_escrow_vault.to_account_info(),
-                        to: self.fail_vault.to_account_info(),
-                        authority: self.pm_lp_pool.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                to_fail,
-            )?;
-        }
-        Ok(())
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.pool_escrow_vault.to_account_info(),
+                    to: self.collateral_vault.to_account_info(),
+                    authority: self.pm_lp_pool.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
     }
 }
 
@@ -9644,10 +9639,11 @@ pub struct DeallocatePoolFromCurve<'info> {
     #[account(mut, seeds = [b"pm_curve", challenge.key().as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, address = curve.curve_inventory_position)]
+    pub curve_inventory: Box<Account<'info, MarketPosition>>,
 
     #[account(
         mut,
@@ -9666,37 +9662,21 @@ pub struct DeallocatePoolFromCurve<'info> {
 impl<'info> DeallocatePoolFromCurve<'info> {
     /// PDA-signed by the CURVE (the source of this transfer) — the symmetric reverse of
     /// `AllocatePoolToCurve::disburse`.
-    fn withdraw(&self, from_pass: u64, from_fail: u64, challenge: &Pubkey, bump: &[u8; 1]) -> Result<()> {
-        let seeds = pm_curve_signer(challenge, bump);
-        if from_pass > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.pass_vault.to_account_info(),
-                        to: self.pool_escrow_vault.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_pass,
-            )?;
-        }
-        if from_fail > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.fail_vault.to_account_info(),
-                        to: self.pool_escrow_vault.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_fail,
-            )?;
-        }
-        Ok(())
+    fn withdraw(&self, amount: u64) -> Result<()> {
+        let bump = [self.curve.bump];
+        let seeds = pm_curve_signer(&self.curve.challenge, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.collateral_vault.to_account_info(),
+                    to: self.pool_escrow_vault.to_account_info(),
+                    authority: self.curve.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
     }
 }
 
@@ -9705,10 +9685,8 @@ pub struct SweepCurveFeesToPool<'info> {
     #[account(mut, seeds = [b"pm_curve", curve.challenge.as_ref()], bump = curve.bump)]
     pub curve: Box<Account<'info, MarketCurve>>,
 
-    #[account(mut, address = curve.pass_vault)]
-    pub pass_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, address = curve.fail_vault)]
-    pub fail_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = curve.collateral_vault)]
+    pub collateral_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -9725,37 +9703,20 @@ pub struct SweepCurveFeesToPool<'info> {
 }
 
 impl<'info> SweepCurveFeesToPool<'info> {
-    fn sweep(&self, from_pass: u64, from_fail: u64, challenge: &Pubkey, bump: &[u8; 1]) -> Result<()> {
+    fn sweep(&self, amount: u64, challenge: &Pubkey, bump: &[u8; 1]) -> Result<()> {
         let seeds = pm_curve_signer(challenge, bump);
-        if from_pass > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.pass_vault.to_account_info(),
-                        to: self.pool_yield_vault.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_pass,
-            )?;
-        }
-        if from_fail > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    self.token_program.to_account_info(),
-                    anchor_spl::token::Transfer {
-                        from: self.fail_vault.to_account_info(),
-                        to: self.pool_yield_vault.to_account_info(),
-                        authority: self.curve.to_account_info(),
-                    },
-                    &[&seeds],
-                ),
-                from_fail,
-            )?;
-        }
-        Ok(())
+        token::transfer(
+            CpiContext::new_with_signer(
+                self.token_program.to_account_info(),
+                anchor_spl::token::Transfer {
+                    from: self.collateral_vault.to_account_info(),
+                    to: self.pool_yield_vault.to_account_info(),
+                    authority: self.curve.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )
     }
 }
 
@@ -11154,27 +11115,55 @@ pub struct PredictionMarketLpPosition {
     pub bump: u8,
 }
 
-// ───────────────────────── Prediction Market Curve (Phase 3 pooled-LP AMM plan) ─────────────────────────
-// Per-market two-sided AMM: two independent constant-product legs (PASS, FAIL), each priced by the
-// exact same `bonding_curve::buy_output`/`sell_output` math reused UNMODIFIED. Plan judgment call #2:
-// NOT a true Gnosis-style complementary-outcome AMM — that needs a quadratic sell formula this
-// codebase has no fuzz coverage for. Two independent legs reuse curve math this repo already fuzzes
-// (`curve_roundtrip_never_profits`/`curve_k_never_decreases_on_trades`), at the disclosed cost that a
-// side's average fill price sits structurally below $1 — mitigated by the price-ceiling guard
-// (`buy_shares`) and the solvency-capped payout (`pm_redeem_payout`).
+// ───────────────────────── Prediction Market Curve (split/merge/swap CTF-style design) ─────────────────────────
+// A real Gnosis Conditional-Tokens-Framework-style market, replacing the original two-independent-
+// CPMM-leg design 2026-08-06 after SIM 12 (`reports/2026-08-06-prediction-market-v2-amm-economics-sim.md`)
+// proved that design's solvency haircut bit ~65-70% of the time under lopsided flow — the market's
+// ordinary state near real resolution, not a rare edge case. See DEC-89 for the full decision record.
+//
+// Core idea: PASS and FAIL shares are ALWAYS minted together as a matched pair from real collateral
+// (`split_collateral`, 1:1, no curve math) and can ALWAYS be merged back 1:1 (`merge_shares`) any
+// time before resolution. A holder who only wants one-sided exposure trades away the unwanted side
+// via `swap_curve_shares` — a literal, unmodified reuse of `bonding_curve::buy_output`/`sell_output`,
+// treating the curve's own AMM inventory (`curve_inventory_position`, a `MarketPosition` owned by the
+// curve's OWN PDA) as the counterparty. This needs no new curve math at all (the only CPMM call is
+// the exact same one already fuzz-tested for the old design) — the previously-rejected "unaudited
+// quadratic sell formula" concern is avoided by decomposing buy/sell into simple 1:1 primitives
+// instead of one instruction that solves for a single-sided position directly.
+//
+// This makes solvency a closed accounting identity instead of a probabilistic one: because split and
+// merge are the ONLY instructions that ever touch `collateral_vault`, and both are exact 1:1,
+// `total_pass_outstanding == total_fail_outstanding == collateral_vault.amount - (firm_fees_accrued +
+// platform_fees_accrued + pool_fees_accrued)` holds for ANY sequence of split/merge/swap — no
+// dependency on how lopsided trading gets. `redeem_shares` needs no haircut formula at all as a
+// result — see that instruction's doc comment.
+//
+// What's lost, stated plainly: the old design's `pass_vault`/`fail_vault` were real SPL
+// `TokenAccount`s, so an arithmetic bug in this program could never cause an overpay — the SPL token
+// program itself would reject a transfer exceeding real balance, an independent enforcement layer.
+// The curve's own inventory here is a plain program-tracked `MarketPosition` like any user's, so that
+// independent layer is gone for the inventory side specifically. Mitigated by: the invariant above
+// being a first-class fuzz target (not just trusted arithmetic — see the invariant fuzz test),
+// defensive `.min()` caps on every real token transfer (matching this file's existing style), and a
+// dedicated pre-ship economics/invariant simulation that tries to break it under adversarial
+// sequencing before any real firm is exposed — the check the OLD design's process was missing, which
+// is what let its haircut ship undetected until SIM 12 found it after the fact.
 
-/// Which leg of a `MarketCurve` an instruction targets. Mirrors `challenge::ChallengeStatus`'s
-/// plain-enum convention (no repr, no associated data — Anchor's default discriminant tag).
+/// Which leg of a `MarketCurve`/`MarketPosition` an instruction targets. Mirrors
+/// `challenge::ChallengeStatus`'s plain-enum convention (no repr, no associated data — Anchor's
+/// default discriminant tag).
 #[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PmSide {
     Pass,
     Fail,
 }
 
-/// `MarketCurve` lifecycle. `Open` trades; `Locked` freezes trading ahead of settlement; `Settled`
-/// unlocks `redeem_shares`; `Void` is the no-resolution escape hatch (`void_market`), unlocked by the
-/// separate pro-rata-per-side `redeem_void_shares` path — see `void_market`'s doc comment for why it
-/// can't reuse `redeem_shares`' pooled-across-both-vaults formula.
+/// `MarketCurve` lifecycle. `Open` trades (`split_collateral`/`merge_shares`/`swap_curve_shares` all
+/// require it); `Locked` freezes NEW trading ahead of settlement but still allows `merge_shares` (a
+/// pure exit with no directional information, safe right up to settlement); `Settled` unlocks
+/// `redeem_shares`; `Void` is the no-resolution escape hatch (`void_market`), unlocked by the separate
+/// `redeem_void_shares`/`redeem_void_curve_inventory` paths (flat 50/50, no pooling-across-vaults
+/// question anymore since there's only one vault) — see `pm_void_redeem_payout`'s doc comment.
 #[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PmCurveStatus {
     Open,
@@ -11183,39 +11172,45 @@ pub enum PmCurveStatus {
     Void,
 }
 
-/// A per-market two-sided AMM binding 1:1 to a real on-chain evaluation. Seeds: ["pm_curve",
-/// challenge]. Vaults: ["pm_curve_pass", challenge] / ["pm_curve_fail", challenge]. See this
-/// section's header comment for why the two legs are independent rather than a true
-/// complementary-outcome pair, and `pm_redeem_payout`'s doc comment for the settlement math that
-/// mitigates the resulting solvency gap.
+/// A per-market split/merge/swap AMM binding 1:1 to a real on-chain evaluation. Seeds: ["pm_curve",
+/// challenge]. Single shared vault: ["pm_curve_collateral", challenge]. See this section's header
+/// comment for the full design and the invariant that makes settlement exact 1:1 with no haircut.
 #[account]
 #[derive(InitSpace)]
 pub struct MarketCurve {
     pub firm: Pubkey,
     pub challenge: Pubkey,
     /// Copied from `challenge.trader` at `init_market_curve` so every instruction that needs to bind
-    /// against the trader (`add_curve_topup`'s self-LP ban) does so with no extra account read.
+    /// against the trader (`add_curve_topup`'s and `swap_curve_shares`' self-LP bans) does so with no
+    /// extra account read.
     pub trader: Pubkey,
     pub firma_mint: Pubkey,
-    pub pass_vault: Pubkey,
-    pub fail_vault: Pubkey,
-    /// Non-withdrawable phantom seed, mirrors `bonding_curve.virtual_sol` — sets a non-zero starting
-    /// price with no real capital. Immutable after init; also the fixed anchor
-    /// `pm_curve_available_shares` scales by (see `PM_CURVE_SHARE_SUPPLY_MULTIPLIER`'s doc comment).
+    /// The ONE shared collateral vault backing every PASS+FAIL pair ever split. Only `split_collateral`
+    /// and `merge_shares` (plus the internal fee self-merge inside `swap_curve_shares`, and the
+    /// `*_pool_to_curve`/`sweep_curve_fees_to_pool` transfers) ever move real tokens through this.
+    pub collateral_vault: Pubkey,
+    /// The `MarketPosition` PDA the curve's own AMM inventory lives in — owned by the curve's OWN
+    /// PDA as `holder` (sound: a PDA is guaranteed off the ed25519 curve, so it can never collide
+    /// with a real wallet). Created eagerly at `init_market_curve`.
+    pub curve_inventory_position: Pubkey,
+    /// Non-withdrawable phantom seed, mirrors `bonding_curve.virtual_sol` — gives this leg SOME
+    /// tradeable depth in `swap_curve_shares` from the instant the curve opens, independent of when
+    /// real inventory (pool money or a top-up) arrives. Immutable after init. Never counted toward
+    /// `total_pass_outstanding`/redeemable — a virtual seed never corresponds to a real minted share.
     pub pass_virtual: u64,
-    pub pass_real: u64,
-    /// PASS shares OUTSTANDING — total currently held across all `MarketPosition`s (Σ
-    /// `position.pass_shares`). NOT the curve's own AMM sell-reserve: `redeem_shares`' pro-rata payout
-    /// divides by this, so it has to mean "shares winners actually hold," not "shares the curve
-    /// hasn't sold yet" — see `pm_curve_available_shares`, which derives the latter as this field's
-    /// complement for the buy/sell math instead of storing it separately.
-    pub pass_shares: u64,
     pub fail_virtual: u64,
-    pub fail_real: u64,
-    pub fail_shares: u64,
-    /// Subset of `pass_real + fail_real` sourced from the shared `PredictionMarketLpPool` via
-    /// `allocate_pool_to_curve`. Tracked SEPARATELY from `topup_deposited` — that separation is what
-    /// makes `deallocate_pool_from_curve`'s `amount <= pool_allocated` ceiling possible (a compromised
+    /// Global running total of PASS shares outstanding across EVERY `MarketPosition`, INCLUDING the
+    /// curve's own inventory position. Always equal to `total_fail_outstanding` (the core invariant —
+    /// see this section's header comment) for any sequence of split/merge/swap. Deliberately renamed
+    /// from the old design's `pass_shares` (which meant something different — shares outstanding held
+    /// by EXTERNAL positions only) so old logic can never be copy-paste-ported against this field by
+    /// mistake.
+    pub total_pass_outstanding: u64,
+    pub total_fail_outstanding: u64,
+    /// Subset of `total_pass_outstanding`/`total_fail_outstanding` sourced from the shared
+    /// `PredictionMarketLpPool` via `allocate_pool_to_curve`, credited equally to the curve's own
+    /// inventory. Tracked SEPARATELY from `topup_deposited` — that separation is what makes
+    /// `deallocate_pool_from_curve`'s `amount <= pool_allocated` ceiling possible (a compromised
     /// keeper can never claw back a permissionless top-up depositor's own funds; see that
     /// instruction's doc comment).
     pub pool_allocated: u64,
@@ -11240,15 +11235,21 @@ pub struct MarketCurve {
     pub bump: u8,
 }
 
-/// A holder's position in one `MarketCurve`. Seeds: ["pm_position", curve, holder].
+/// A holder's position in one `MarketCurve`. Seeds: ["pm_position", curve, holder]. Dual-purpose:
+/// every ORDINARY trader's position uses this shape, and so does the CURVE'S OWN AMM inventory
+/// (`MarketCurve.curve_inventory_position`, seeded `holder == curve.key()`) — reusing the exact same
+/// struct rather than inventing a parallel "inventory" type, since a curve's inventory is
+/// economically just another set of PASS/FAIL share balances that happens to be owned by the program
+/// itself instead of a wallet.
 ///
 /// Plain program-tracked state, NOT a pair of new SPL mints per market. At the scale this is designed
 /// for (every promoted market gets a curve), two mints + one ATA per (holder, mint) per market would
 /// make rent dominate — a single PDA with two `u64` fields costs the same no matter how many markets
 /// exist. No peer-to-peer share transferability is needed either: every balance change already routes
-/// through a program instruction (`buy_shares`/`sell_shares`/`redeem_shares`/`redeem_void_shares`), so
-/// there's nothing an SPL mint would buy beyond rent cost — the same reasoning
-/// `PredictionMarketLpPosition.amount_staked` already uses for LP shares instead of an LP-token mint.
+/// through a program instruction (`split_collateral`/`merge_shares`/`swap_curve_shares`/
+/// `redeem_shares`/`redeem_void_shares`), so there's nothing an SPL mint would buy beyond rent cost —
+/// the same reasoning `PredictionMarketLpPosition.amount_staked` already uses for LP shares instead of
+/// an LP-token mint.
 #[account]
 #[derive(InitSpace)]
 pub struct MarketPosition {
@@ -11756,7 +11757,7 @@ pub struct PmLpYieldClaimed {
     pub yield_paid: u64,
 }
 
-// ── Prediction Market Curve (Phase 3 pooled-LP AMM plan) ──
+// ── Prediction Market Curve (split/merge/swap CTF-style design, 2026-08-06) ──
 
 #[event]
 pub struct MarketCurveInitialized {
@@ -11767,22 +11768,26 @@ pub struct MarketCurveInitialized {
 }
 
 #[event]
-pub struct MarketSharesBought {
+pub struct CollateralSplit {
     pub curve: Pubkey,
-    pub holder: Pubkey,
-    pub side: PmSide,
-    pub collateral_in: u64,
-    pub shares_out: u64,
-    pub fee: u64,
+    pub depositor: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
-pub struct MarketSharesSold {
+pub struct SharesMerged {
     pub curve: Pubkey,
     pub holder: Pubkey,
-    pub side: PmSide,
-    pub shares_in: u64,
-    pub collateral_out: u64,
+    pub amount: u64,
+}
+
+#[event]
+pub struct MarketSharesSwapped {
+    pub curve: Pubkey,
+    pub holder: Pubkey,
+    pub from_side: PmSide,
+    pub amount_in: u64,
+    pub amount_out: u64,
     pub fee: u64,
 }
 
@@ -11790,7 +11795,6 @@ pub struct MarketSharesSold {
 pub struct MarketCurveToppedUp {
     pub curve: Pubkey,
     pub depositor: Pubkey,
-    pub side: PmSide,
     pub amount: u64,
 }
 
@@ -11818,8 +11822,14 @@ pub struct MarketSharesRedeemed {
 pub struct MarketVoidRedeemed {
     pub curve: Pubkey,
     pub holder: Pubkey,
-    pub pass_payout: u64,
-    pub fail_payout: u64,
+    pub payout: u64,
+}
+
+#[event]
+pub struct MarketVoidCurveInventoryRedeemed {
+    pub curve: Pubkey,
+    pub firm: Pubkey,
+    pub payout: u64,
 }
 
 #[event]
@@ -11827,8 +11837,6 @@ pub struct PmCurveAllocated {
     pub curve: Pubkey,
     pub firm: Pubkey,
     pub amount: u64,
-    pub to_pass: u64,
-    pub to_fail: u64,
 }
 
 #[event]
@@ -11836,8 +11844,6 @@ pub struct PmCurveDeallocated {
     pub curve: Pubkey,
     pub firm: Pubkey,
     pub amount: u64,
-    pub from_pass: u64,
-    pub from_fail: u64,
 }
 
 #[event]
@@ -12346,12 +12352,10 @@ pub enum FirmError {
     PmLpDailyCapExceeded,
     #[msg("PM LP withdrawals are frozen while the firm's velocity-break circuit breaker is active")]
     PmLpVelocityBreakActive,
-    // Appended (Phase 3 — Prediction Market Curve, per-market two-sided AMM).
+    // Appended (Prediction Market Curve, per-market split/merge/swap AMM).
     #[msg("this trade would receive fewer shares/collateral than the caller's slippage floor")]
     PmSlippageExceeded,
-    #[msg("this buy would push the leg's implied price past its $1 settlement ceiling")]
-    PmPriceCeilingExceeded,
-    #[msg("a market's own trader may never fund their own curve — self-LP is routed only through the shared PredictionMarketLpPool")]
+    #[msg("a market's own trader may never fund their own curve or swap on it — self-LP/self-trading is routed only through the shared PredictionMarketLpPool")]
     PmSelfLpBanned,
     #[msg("this position does not hold enough shares on this side to cover the requested amount")]
     PmInsufficientShares,
@@ -12365,6 +12369,10 @@ pub enum FirmError {
     PmMarketNotOpen,
     #[msg("firm_fee_bps + platform_fee_bps + pool_fee_bps must sum to exactly fee_bps")]
     PmFeeSplitMismatch,
+    #[msg("this deallocation would exceed the curve's own still-matched inventory (the traded-away imbalance stays as swap-liquidity backing)")]
+    PmExceedsCurveInventory,
+    #[msg("use redeem_void_curve_inventory for the curve's own inventory position, not redeem_void_shares")]
+    PmUseCurveInventoryRedemption,
 }
 
 #[cfg(test)]
@@ -14459,114 +14467,11 @@ mod tests {
         }
     }
 
-    // ───────── Prediction Market Curve (Phase 3 pooled-LP AMM plan) ─────────
-    // Pure-function coverage mirroring `bonding_curve`'s own `curve_roundtrip_never_profits`/
-    // `curve_k_never_decreases_on_trades` methodology, adapted to `MarketCurve`'s two-leg design.
-
-    #[test]
-    fn pm_curve_available_shares_is_the_outstanding_complement() {
-        assert_eq!(pm_curve_available_shares(1_000, 0), 2_000); // fresh leg, MULTIPLIER=2
-        assert_eq!(pm_curve_available_shares(1_000, 500), 1_500);
-        assert_eq!(pm_curve_available_shares(1_000, 2_000), 0); // fully sold down
-        // Saturates rather than underflows/panics if shares_outstanding ever exceeded the cap
-        // (shouldn't happen in correct operation, same defensive posture as everything else here).
-        assert_eq!(pm_curve_available_shares(1_000, 5_000), 0);
-    }
-
-    #[test]
-    fn pm_curve_buy_then_sell_roundtrip_never_profits() {
-        // THE most important test in this phase. Adapts `bonding_curve::curve_roundtrip_never_profits`'s
-        // exact methodology to the two-leg curve: buy shares on one leg, immediately sell the exact
-        // shares just received, replaying `buy_shares`/`sell_shares`' arithmetic verbatim (fee,
-        // `pm_curve_available_shares`, `bonding_curve::buy_output`/`sell_output`). Must never return
-        // more collateral than was put in, at ANY fee tier including 0% — the R40 rounding-toward-the-
-        // pool guarantee (inherited unmodified from `bonding_curve`) is what stops profit even at zero
-        // fee; a real fee only widens the loss.
-        let fees: [u16; 5] = [0, 1, 50, 100, 300];
-        for seed in 0..50_000u64 {
-            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(11);
-            let mut next = || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            let virtual_seed = (next() % 100_000_000_000) + 1; // 1 .. 100 (curve units)
-            let real0 = next() % 1_000_000_000_000; // 0 .. 1000, incl. a never-traded curve
-            let cap = virtual_seed.saturating_mul(PM_CURVE_SHARE_SUPPLY_MULTIPLIER).max(1);
-            let shares_outstanding0 = next() % cap;
-            let fee_bps = fees[(next() % fees.len() as u64) as usize];
-            let collateral_in = (next() % 200_000_000_000) + 1;
-
-            let available0 = pm_curve_available_shares(virtual_seed, shares_outstanding0);
-            if available0 == 0 {
-                continue;
-            }
-            let eff0 = virtual_seed as u128 + real0 as u128;
-
-            let fee = bonding_curve::fee_amount(collateral_in, fee_bps);
-            let net = match collateral_in.checked_sub(fee) {
-                Some(v) => v,
-                None => continue,
-            };
-            let shares_out = match bonding_curve::buy_output(eff0, available0 as u128, net as u128) {
-                Some(v) if v > 0 && v <= available0 => v,
-                _ => continue,
-            };
-
-            let real1 = real0 + net;
-            let shares_outstanding1 = shares_outstanding0 + shares_out;
-            let available1 = pm_curve_available_shares(virtual_seed, shares_outstanding1);
-            let eff1 = virtual_seed as u128 + real1 as u128;
-
-            let gross = match bonding_curve::sell_output(eff1, available1 as u128, shares_out as u128) {
-                Some(v) if v <= real1 => v, // handler guard: can't draw down the virtual seed
-                _ => continue,
-            };
-            let sell_fee = bonding_curve::fee_amount(gross, fee_bps);
-            let net_out = gross.saturating_sub(sell_fee);
-
-            assert!(
-                net_out <= collateral_in,
-                "ROUND-TRIP PROFIT (seed {seed}): put in {collateral_in}, got back {net_out} \
-                 (virtual {virtual_seed}, real0 {real0}, shares_outstanding0 {shares_outstanding0}, \
-                 fee_bps {fee_bps}, shares_out {shares_out}, gross {gross})"
-            );
-        }
-    }
-
-    #[test]
-    fn pm_curve_price_ceiling_guard_rejects_overpriced_buy_but_allows_a_safe_one() {
-        // The guard itself is inline in `buy_shares` (not a separate function, per the plan's given
-        // formula) — this pins the exact boolean condition (`eff_after <= new_available`) against a
-        // buy sized to actually breach it, and a small buy that stays safely under it.
-        let virtual_seed: u64 = 1_000;
-        let shares_outstanding0: u64 = 0; // fresh leg — available0 = 2 × virtual = 2000, price starts 0.5
-        let available0 = pm_curve_available_shares(virtual_seed, shares_outstanding0);
-        assert_eq!(available0, 2_000);
-        let eff0 = virtual_seed as u128; // real0 = 0
-
-        // A buy large relative to the 2000-share pool pushes price toward/above 1.0.
-        let net: u128 = 5_000;
-        let shares_out = bonding_curve::buy_output(eff0, available0 as u128, net).unwrap();
-        let new_available = pm_curve_available_shares(virtual_seed, shares_outstanding0 + shares_out);
-        let eff_after = eff0 + net;
-        assert!(
-            eff_after > new_available as u128,
-            "test fixture must actually breach the ceiling (eff_after {eff_after}, new_available {new_available})"
-        );
-
-        // A small, safe buy stays under the ceiling.
-        let safe_net: u128 = 10;
-        let safe_shares_out = bonding_curve::buy_output(eff0, available0 as u128, safe_net).unwrap();
-        let safe_new_available =
-            pm_curve_available_shares(virtual_seed, shares_outstanding0 + safe_shares_out);
-        let safe_eff_after = eff0 + safe_net;
-        assert!(
-            safe_eff_after <= safe_new_available as u128,
-            "a small buy should stay under the ceiling"
-        );
-    }
+    // ───────── Prediction Market Curve (split/merge/swap CTF-style design, 2026-08-06) ─────────
+    // Replaces the old two-leg design's test suite after SIM 12 found its haircut bit ~65-70% of the
+    // time under lopsided flow. The invariant fuzz below is the concrete process fix: the OLD design
+    // shipped without ever trying to break its own solvency claim under adversarial sequencing — this
+    // suite exists so a future regression can't ship the same way again.
 
     #[test]
     fn split_curve_fee_3way_sums_to_fee_and_pool_absorbs_the_remainder() {
@@ -14582,39 +14487,15 @@ mod tests {
     }
 
     #[test]
-    fn pm_redeem_payout_is_exact_1to1_when_well_funded() {
-        // redeemable_total (500) >= winning_shares_outstanding (300) → true 1:1, capped at exactly
-        // what this holder holds, never more.
-        assert_eq!(pm_redeem_payout(120, 300, 500), 120);
-        assert_eq!(pm_redeem_payout(300, 300, 500), 300); // the entire pool of winning shares
-        assert_eq!(pm_redeem_payout(300, 300, 300), 300); // exactly break-even funded
-    }
-
-    #[test]
-    fn pm_redeem_payout_applies_the_exact_haircut_ratio_when_underfunded() {
-        // redeemable_total (150) < winning_shares_outstanding (300) → haircut = position_shares ×
-        // redeemable_total / shares_outstanding, floored. Hand-computed: 120 × 150 / 300 = 60 exactly.
-        assert_eq!(pm_redeem_payout(120, 300, 150), 60);
-        // Uneven ratio: 120 × 101 / 300 = 40.4 → floors to 40.
-        assert_eq!(pm_redeem_payout(120, 300, 101), 40);
-        // Floor-rounded haircut shares must never sum past the pot (R40 discipline).
-        let a = pm_redeem_payout(120, 300, 101);
-        let b = pm_redeem_payout(180, 300, 101);
-        assert!(a + b <= 101, "haircut shares summed ({}) exceed the pot (101)", a + b);
-    }
-
-    #[test]
-    fn pm_redeem_payout_zero_shares_outstanding_is_zero_not_a_panic() {
-        assert_eq!(pm_redeem_payout(0, 0, 500), 0);
-    }
-
-    #[test]
     fn pm_deallocate_ceiling_ignores_topup_deposited() {
-        // SECURITY-CRITICAL: `deallocate_pool_from_curve`'s guard is `amount <= curve.pool_allocated`
-        // ONLY. `topup_deposited` must never factor in, even though `pass_real + fail_real` (which a
-        // naive check might use instead) would happily "cover" a larger amount — that's exactly the
-        // hole this ceiling exists to close: a compromised keeper authority must never be able to
-        // claw back a permissionless top-up depositor's own funds.
+        // SECURITY-CRITICAL: `deallocate_pool_from_curve`'s pool-allocation guard is
+        // `amount <= curve.pool_allocated` ONLY. `topup_deposited` must never factor into THAT check,
+        // even though the curve's total real inventory (which a naive check might use instead) would
+        // happily "cover" a larger amount — that's exactly the hole this ceiling exists to close: a
+        // compromised keeper authority must never be able to claw back a permissionless top-up
+        // depositor's own funds. (The SEPARATE new `PmExceedsCurveInventory` guard is covered by
+        // `pm_ctf_invariant_holds_across_random_split_merge_swap_sequences` below, since it depends
+        // on live inventory balances a static hand-picked fixture can't usefully pin.)
         let pool_allocated: u64 = 100;
         let topup_deposited: u64 = 5_000; // vastly more, but MUST be irrelevant to this check
         let requested: u64 = 150; // exceeds pool_allocated even though real reserves (>=5100) cover it
@@ -14635,7 +14516,7 @@ mod tests {
     #[test]
     fn pm_add_curve_topup_self_lp_ban_is_unconditional() {
         // Mirrors `add_curve_topup`'s FIRST require: `depositor.key() != curve.trader`. The trader's
-        // own wallet must fail this check regardless of side/amount; any other wallet must pass it.
+        // own wallet must fail this check regardless of amount; any other wallet must pass it.
         let trader = Pubkey::new_unique();
         let depositor_self = trader;
         let depositor_other = Pubkey::new_unique();
@@ -14646,33 +14527,252 @@ mod tests {
     }
 
     #[test]
-    fn pm_void_redeem_payout_pro_rata_hand_computed_no_cross_vault_pooling() {
-        // PASS side: 3 holders share pass_shares_outstanding=300 pro-rata over pass_real=90.
-        // A: 150 shares (50%) → 45. B: 90 shares (30%) → 27. C: 60 shares (20%) → 18.
-        assert_eq!(pm_void_redeem_payout(150, 300, 90), 45);
-        assert_eq!(pm_void_redeem_payout(90, 300, 90), 27);
-        assert_eq!(pm_void_redeem_payout(60, 300, 90), 18);
-        assert_eq!(45 + 27 + 18, 90); // sums to the full pot exactly in this fixture
-
-        // FAIL side is INDEPENDENT — a market with pass_real=90 but fail_real=0 pays FAIL holders
-        // zero, never dipping into the PASS side's pot (no pooling across vaults, unlike
-        // `pm_redeem_payout`'s settled-market formula).
-        assert_eq!(pm_void_redeem_payout(100, 200, 0), 0);
+    fn pm_swap_self_trade_ban_is_unconditional() {
+        // Mirrors `swap_curve_shares`' ban: `signer.key() != curve.trader`. Unlike the old design,
+        // this is where the self-trade ban actually needed to live (PM2-SELFTRADE-1's lesson) —
+        // `split_collateral`/`merge_shares` don't need one at all, since holding an always-equal pair
+        // has no exploitable directional exposure for anyone, including the trader.
+        let trader = Pubkey::new_unique();
+        let signer_self = trader;
+        let signer_other = Pubkey::new_unique();
+        let self_trade_check = |signer: Pubkey| signer != trader;
+        assert!(!self_trade_check(signer_self), "the trader's own wallet must fail this check");
+        assert!(self_trade_check(signer_other), "any other wallet must pass this check");
     }
 
     #[test]
-    fn pm_pool_ratio_split_preserves_current_ratio_and_falls_back_to_virtual_when_untraded() {
-        // Traded curve: pass_real=300, fail_real=100 (3:1) — a 400 allocation splits 300/100.
-        assert_eq!(pm_pool_ratio_split(400, 300, 100), (300, 100));
+    fn pm_void_redeem_payout_flat_fifty_fifty_with_worked_dust_example() {
+        // Even split: floor((2+2)/2) = 2, exact.
+        assert_eq!(pm_void_redeem_payout(2, 2), 2);
+        // Odd split: floor((2+1)/2) = 1, not 1.5 — dust safely retained, never overpaid.
+        assert_eq!(pm_void_redeem_payout(2, 1), 1);
+        assert_eq!(pm_void_redeem_payout(0, 0), 0);
 
-        // Never-traded curve (both real legs 0) — caller passes virtual seeds instead, avoiding a
-        // divide-by-zero; equal virtual seeds split 50/50.
-        assert_eq!(pm_pool_ratio_split(100, 500, 500), (50, 50));
+        // Worked dust example from the doc comment: vault=3, A=(pass=2,fail=1)→1, B=(pass=1,fail=2)→1,
+        // total paid=2, 1 unit of dust safely retained (never insolvent).
+        let vault: u64 = 3;
+        let payout_a = pm_void_redeem_payout(2, 1);
+        let payout_b = pm_void_redeem_payout(1, 2);
+        assert_eq!((payout_a, payout_b), (1, 1));
+        assert!(payout_a + payout_b <= vault, "void payouts must never exceed the vault");
+    }
 
-        // Degenerate zero/zero weights (shouldn't happen — virtual seeds are required > 0 at init)
-        // still falls back to an even split rather than panicking.
-        let (to_pass3, to_fail3) = pm_pool_ratio_split(101, 0, 0);
-        assert_eq!(to_pass3 + to_fail3, 101);
+    #[test]
+    fn pm_void_redeem_payout_never_exceeds_the_vault_across_random_positions() {
+        // General fuzz proof of the doc comment's claim: for any set of positions whose pass-shares
+        // sum to C and whose fail-shares ALSO sum to C (the core invariant), Σ floor((Pᵢ+Fᵢ)/2) ≤ C.
+        for seed in 0..20_000u64 {
+            let mut s = seed.wrapping_mul(0x2545F4914F6CDD1D).wrapping_add(3);
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            let n = (next() % 8) + 1; // 1..=8 positions sharing the pot
+            let c = (next() % 1_000_000) + 1; // total collateral == total pass == total fail
+            let mut pass_left = c;
+            let mut fail_left = c;
+            let mut total_paid: u128 = 0;
+            for i in 0..n {
+                let p = if i + 1 == n { pass_left } else { next() % (pass_left + 1) };
+                let f = if i + 1 == n { fail_left } else { next() % (fail_left + 1) };
+                pass_left -= p;
+                fail_left -= f;
+                total_paid += pm_void_redeem_payout(p, f) as u128;
+            }
+            assert!(
+                total_paid <= c as u128,
+                "seed {seed}: void payouts summed to {total_paid}, exceeding vault {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn pm_ctf_swap_round_trip_never_profits() {
+        // Adapts the old design's round-trip-never-profits methodology to the new `swap_curve_shares`
+        // primitive: swap `amount_in` PASS→FAIL against the curve's own inventory, then immediately
+        // swap the EXACT FAIL just received back to PASS, replaying the handler's arithmetic verbatim
+        // (fee taken on BOTH legs now, unlike the old design's single buy-or-sell fee). Must never
+        // return more than `amount_in`, at any fee tier including 0% — the underlying
+        // `buy_output`/`sell_output` R40 rounding-toward-the-pool guarantee (reused unmodified) is
+        // what stops profit even at zero fee.
+        let fees: [u16; 5] = [0, 1, 50, 100, 300];
+        for seed in 0..50_000u64 {
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(13);
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            let pass_virtual = (next() % 1_000_000_000) + 1;
+            let fail_virtual = (next() % 1_000_000_000) + 1;
+            let inv_pass0 = next() % 1_000_000_000;
+            let inv_fail0 = next() % 1_000_000_000;
+            let fee_bps = fees[(next() % fees.len() as u64) as usize];
+            let amount_in = (next() % 500_000_000) + 1;
+
+            // Leg 1: PASS -> FAIL.
+            let eff_from1 = (pass_virtual as u128) + (inv_pass0 as u128);
+            let reserve_to1 = (fail_virtual as u128) + (inv_fail0 as u128);
+            let gross1 = match bonding_curve::buy_output(eff_from1, reserve_to1, amount_in as u128) {
+                Some(v) if v > 0 => v,
+                _ => continue,
+            };
+            let fee1 = bonding_curve::fee_amount(gross1, fee_bps);
+            let net1 = gross1.saturating_sub(fee1);
+            if net1 == 0 || net1 > inv_fail0 {
+                continue;
+            }
+            let inv_pass1 = inv_pass0 + amount_in;
+            let inv_fail1 = inv_fail0 - net1;
+
+            // Leg 2: swap the exact FAIL just received (net1) back to PASS.
+            let eff_from2 = (fail_virtual as u128) + (inv_fail1 as u128);
+            let reserve_to2 = (pass_virtual as u128) + (inv_pass1 as u128);
+            let gross2 = match bonding_curve::buy_output(eff_from2, reserve_to2, net1 as u128) {
+                Some(v) => v,
+                None => continue,
+            };
+            let fee2 = bonding_curve::fee_amount(gross2, fee_bps);
+            let net2 = gross2.saturating_sub(fee2);
+
+            assert!(
+                net2 <= amount_in,
+                "ROUND-TRIP PROFIT (seed {seed}): swapped in {amount_in} PASS, got back {net2} PASS \
+                 (pass_virtual {pass_virtual}, fail_virtual {fail_virtual}, inv_pass0 {inv_pass0}, \
+                 inv_fail0 {inv_fail0}, fee_bps {fee_bps}, net1 {net1}, gross2 {gross2})"
+            );
+        }
+    }
+
+    #[test]
+    fn pm_ctf_invariant_holds_across_random_split_merge_swap_sequences() {
+        // THE most important test in this design — the check the OLD design's process never ran
+        // until SIM 12 found the haircut bug after the fact. Simulates `split_collateral`/
+        // `merge_shares`/`swap_curve_shares`' exact arithmetic against one user position + the
+        // curve's own inventory, asserting the core invariant after EVERY single operation, not just
+        // in aggregate: `total_pass_outstanding == total_fail_outstanding`, both equal the sum of
+        // every position's real balances, and `collateral_vault == total_pass_outstanding +
+        // firm_fees_accrued + platform_fees_accrued + pool_fees_accrued`.
+        let fees: [u16; 4] = [0, 1, 200, 500];
+        for seed in 0..20_000u64 {
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(7);
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            let pass_virtual = (next() % 1_000_000) + 1;
+            let fail_virtual = (next() % 1_000_000) + 1;
+            let fee_bps = fees[(next() % fees.len() as u64) as usize];
+            let firm_bps = fee_bps / 3;
+            let platform_bps = fee_bps / 3;
+            let pool_bps = fee_bps.saturating_sub(2 * firm_bps);
+
+            let (mut user_pass, mut user_fail): (u64, u64) = (0, 0);
+            let (mut inv_pass, mut inv_fail): (u64, u64) = (0, 0);
+            let (mut total_pass, mut total_fail): (u64, u64) = (0, 0);
+            let (mut firm_fees, mut platform_fees, mut pool_fees): (u64, u64, u64) = (0, 0, 0);
+            let mut collateral_vault: u64 = 0;
+
+            for _ in 0..40 {
+                match next() % 3 {
+                    0 => {
+                        // split_collateral
+                        let amount = (next() % 1_000_000) + 1;
+                        collateral_vault += amount;
+                        user_pass += amount;
+                        user_fail += amount;
+                        total_pass += amount;
+                        total_fail += amount;
+                    }
+                    1 => {
+                        // merge_shares — only if the user holds a matched pair
+                        let max_mergeable = user_pass.min(user_fail);
+                        if max_mergeable == 0 {
+                            continue;
+                        }
+                        let amount = (next() % max_mergeable) + 1;
+                        collateral_vault -= amount;
+                        user_pass -= amount;
+                        user_fail -= amount;
+                        total_pass -= amount;
+                        total_fail -= amount;
+                    }
+                    _ => {
+                        // swap_curve_shares — from a random side, only if the user holds some
+                        let from_pass = next() % 2 == 0;
+                        let held = if from_pass { user_pass } else { user_fail };
+                        if held == 0 {
+                            continue;
+                        }
+                        let amount_in = (next() % held) + 1;
+                        let (from_virtual, to_virtual) =
+                            if from_pass { (pass_virtual, fail_virtual) } else { (fail_virtual, pass_virtual) };
+                        let (inv_from0, inv_to0) = if from_pass { (inv_pass, inv_fail) } else { (inv_fail, inv_pass) };
+                        let eff_from = (from_virtual as u128) + (inv_from0 as u128);
+                        let reserve_to = (to_virtual as u128) + (inv_to0 as u128);
+                        let gross_out = match bonding_curve::buy_output(eff_from, reserve_to, amount_in as u128) {
+                            Some(v) if v > 0 => v,
+                            _ => continue,
+                        };
+                        let fee = bonding_curve::fee_amount(gross_out, fee_bps);
+                        let net_out = gross_out.saturating_sub(fee);
+                        if net_out == 0 || net_out > inv_to0 {
+                            continue;
+                        }
+                        let inv_from1 = inv_from0 + amount_in;
+                        let inv_to1 = inv_to0 - net_out;
+                        if inv_from1 < fee || inv_to1 < fee {
+                            continue; // the handler's own defensive guard before the fee self-merge
+                        }
+                        let inv_from2 = inv_from1 - fee;
+                        let inv_to2 = inv_to1 - fee;
+
+                        let (firm_cut, platform_cut, pool_cut) =
+                            split_curve_fee_3way(fee, firm_bps, platform_bps, pool_bps, fee_bps);
+                        firm_fees += firm_cut;
+                        platform_fees += platform_cut;
+                        pool_fees += pool_cut;
+
+                        if from_pass {
+                            inv_pass = inv_from2;
+                            inv_fail = inv_to2;
+                            user_pass -= amount_in;
+                            user_fail += net_out;
+                        } else {
+                            inv_fail = inv_from2;
+                            inv_pass = inv_to2;
+                            user_fail -= amount_in;
+                            user_pass += net_out;
+                        }
+                        total_pass -= fee;
+                        total_fail -= fee;
+                    }
+                }
+
+                // THE invariant, checked after EVERY operation, not just at the end.
+                assert_eq!(total_pass, total_fail, "seed {seed}: total_pass_outstanding != total_fail_outstanding");
+                assert_eq!(
+                    user_pass + inv_pass,
+                    total_pass,
+                    "seed {seed}: sum of PASS balances drifted from total_pass_outstanding"
+                );
+                assert_eq!(
+                    user_fail + inv_fail,
+                    total_fail,
+                    "seed {seed}: sum of FAIL balances drifted from total_fail_outstanding"
+                );
+                assert_eq!(
+                    collateral_vault,
+                    total_pass + firm_fees + platform_fees + pool_fees,
+                    "seed {seed}: collateral_vault != total_pass_outstanding + fees_accrued"
+                );
+            }
+        }
     }
 }
 
