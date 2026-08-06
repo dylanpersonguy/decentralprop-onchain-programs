@@ -2275,6 +2275,14 @@ pub mod firm {
         collateral_in: u64,
         min_shares_out: u64,
     ) -> Result<()> {
+        // SECURITY-CRITICAL, same standing as `add_curve_topup`'s identical first check (PM2-SELFTRADE-1,
+        // 2026-08-06 adversarial audit): the trader controls their own evaluation's PASS/FAIL outcome
+        // deterministically, so without this a trader could buy winning-side shares on their own market
+        // with their own ordinary wallet — no proxy needed — and redeem a payout funded by pooled LP
+        // capital and honest bettors, a direct, guaranteed-profit self-dealing drain. `add_curve_topup`
+        // had this ban; `buy_shares` — the instruction that actually creates a redeemable position, and
+        // so the one that most needed it — did not.
+        require!(ctx.accounts.buyer.key() != ctx.accounts.curve.trader, FirmError::PmSelfLpBanned);
         require!(collateral_in > 0, FirmError::ZeroAmount);
         require!(ctx.accounts.curve.status == PmCurveStatus::Open, FirmError::PmMarketNotOpen);
 
@@ -2607,6 +2615,16 @@ pub mod firm {
     pub fn allocate_pool_to_curve(ctx: Context<AllocatePoolToCurve>, amount: u64) -> Result<()> {
         require_market_curve_authority(&ctx.accounts.challenge, &ctx.accounts.firm_state)?;
         require!(amount > 0, FirmError::ZeroAmount);
+        // PM2-ALLOC-RACE-1 (2026-08-06 adversarial audit): unlike `deallocate_pool_from_curve` (whose
+        // doc comment explicitly discloses "nothing blocks a Locked/Settled curve" as an accepted
+        // residual), fresh allocation into an already-Locked/Settled curve was undisclosed and, worse,
+        // realistically reachable without any compromise: the off-chain allocator keeper computes its
+        // allocation decisions from `PredictionMarketEligibility` on its own periodic tick, with no read
+        // of the curve's on-chain status, so a market that settles between two ticks could have pool
+        // capital land AFTER the outcome is already known — directly inflating the known winner's
+        // redemption pot at the pool's expense. Gated here the same way `buy_shares`/`sell_shares`/
+        // `add_curve_topup` already gate on `Open`.
+        require!(ctx.accounts.curve.status == PmCurveStatus::Open, FirmError::PmMarketNotOpen);
 
         let curve = &ctx.accounts.curve;
         let (pass_w, fail_w) = if curve.pass_real == 0 && curve.fail_real == 0 {
@@ -4737,8 +4755,9 @@ fn split_3_1(amount: u64) -> (u64, u64) {
 // redirects away from the treasury toward Owner / DecentralProp / $FIRMA+$DPROP staking / buybacks /
 // the Universal Pool. Fully platform-locked (no operator input, no governance instruction, no stored
 // state) — computed live off already-tracked state on every call, same idiom as `lp_bps_for_depth`
-// one line above, not the `RiskTier` authority-driven state machine. DEC-74: numbers are provisional,
-// not yet founder-approved.
+// one line above, not the `RiskTier` authority-driven state machine. DEC-74: numbers founder-approved
+// 2026-08-06 (zone-0 no-op devnet-proven the same day — `scripts/devnet-treasury-health-zone0-proof.ts`;
+// the threshold-crossing ladder remains localnet-proven, 500+ SOL being impractical on the faucet).
 
 /// Per-tier SOL thresholds (lamports, 9dp) for the 5 zones: Growing (< thresholds[0]) / Healthy /
 /// Strong / Thriving / Saturated (>= thresholds[3]). Starter/Growth/Pro deliberately share one
