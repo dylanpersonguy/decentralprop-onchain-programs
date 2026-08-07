@@ -2550,6 +2550,64 @@ pub mod firm {
         Ok(())
     }
 
+    /// PM2-STALE-1 remediation. The CTF redesign shrank `MarketCurve` (316 -> 300 bytes); redeploying
+    /// changed bytecode does not touch already-existing account bytes, so any curve `init`ed before
+    /// the redesign is stuck at the old size forever with no natural decode error (a shrink, unlike
+    /// every earlier struct change in this program, has no natural failure mode — see
+    /// `isAccountLayoutMismatched`'s doc comment on the off-chain side). This closes exactly that
+    /// known-stale shape so `init_market_curve` can recreate the same PDA fresh under the new layout.
+    ///
+    /// Deliberately conservative — every check is a hard fail, not a warning, and `curve` is
+    /// read as raw bytes rather than the normal typed `Account<MarketCurve>` load specifically so
+    /// this can never be tricked by a corrupted decode:
+    /// 1. PDA re-derived directly from `challenge` (not trusted from a garbage `bump` field).
+    /// 2. `curve.owner` must be this program — refuses an empty/foreign account.
+    /// 3. `curve`'s raw byte length must be EXACTLY `PM_OLD_MARKET_CURVE_ACCOUNT_SIZE` — refuses a
+    ///    properly-migrated new-layout curve (300 bytes) or anything else unrecognized.
+    /// 4. The OLD layout's `pass_real`/`pass_shares`/`fail_real`/`fail_shares` fields (read directly
+    ///    from their known byte offsets, only ever reached after check 3 passes) must all be zero —
+    ///    refuses to close any curve that ever held real value, even if this instruction is invoked
+    ///    against a curve nobody has audited off-chain first. This is the load-bearing safety
+    ///    property: the instruction is safe by construction, not just "safe because someone checked."
+    pub fn close_stale_market_curve(ctx: Context<CloseStaleMarketCurve>) -> Result<()> {
+        require_market_curve_authority(&ctx.accounts.challenge, &ctx.accounts.firm_state)?;
+
+        let (expected_curve, _bump) = Pubkey::find_program_address(
+            &[b"pm_curve", ctx.accounts.challenge.key().as_ref()],
+            ctx.program_id,
+        );
+        require_keys_eq!(ctx.accounts.curve.key(), expected_curve, FirmError::Unauthorized);
+        require!(ctx.accounts.curve.owner == ctx.program_id, FirmError::PmStaleCurveNotOwned);
+
+        {
+            let data = ctx.accounts.curve.try_borrow_data()?;
+            require!(data.len() == PM_OLD_MARKET_CURVE_ACCOUNT_SIZE, FirmError::PmStaleCurveSizeMismatch);
+            require!(!pm_old_curve_has_real_value(&data), FirmError::PmStaleCurveNotEmpty);
+        }
+
+        // Manual close (can't use Anchor's `close = ` constraint — that requires a typed `Account<T>`
+        // load, exactly what this instruction avoids): zero the data so it can never be loaded as a
+        // live account again, then sweep every lamport to `authority`. This leaves the PDA with zero
+        // lamports and zero data, which is exactly what `init_market_curve`'s `system_program::
+        // create_account` needs to recreate it fresh under the new layout.
+        let curve_lamports = ctx.accounts.curve.lamports();
+        **ctx.accounts.authority.to_account_info().lamports.borrow_mut() = ctx
+            .accounts
+            .authority
+            .to_account_info()
+            .lamports()
+            .checked_add(curve_lamports)
+            .ok_or(FirmError::MathOverflow)?;
+        **ctx.accounts.curve.lamports.borrow_mut() = 0;
+        ctx.accounts.curve.try_borrow_mut_data()?.fill(0);
+
+        emit!(StaleMarketCurveClosed {
+            curve: expected_curve,
+            challenge: ctx.accounts.challenge.key(),
+        });
+        Ok(())
+    }
+
     /// Permissionless pull — anyone may crank this, but it always pays `position.holder`'s own token
     /// account (`holder_firma`, constrained to `position.holder`'s ownership), never the caller.
     /// Settlement is O(1) and moves no funds itself (`settle_market`); this is where funds actually
@@ -4735,6 +4793,13 @@ pub const PM_LP_DAILY_OUTFLOW_CAP_BPS: u16 = 1000; // 10%
 // file's "Prediction Market Curve" section header comment for why, and DEC-89 for the decision
 // record. The new design's curve inventory holds real (not notional) shares directly.
 
+/// The pre-redesign `MarketCurve` account's exact on-chain byte size (8-byte discriminator + 6
+/// Pubkeys + 8 u64s [pass/fail virtual/real/shares + pool_allocated/topup_deposited] + 4 fee_bps
+/// u16s + 3 fees_accrued u64s + status + Option<outcome> + 2 i64 timestamps + bump). Used only by
+/// `close_stale_market_curve` (PM2-STALE-1) as a hard gate — an account of any other size is left
+/// untouched.
+const PM_OLD_MARKET_CURVE_ACCOUNT_SIZE: usize = 316;
+
 // Dynamic LP thresholds on the REAL pool reserve, now in **lamports** (wSOL, 9 dp) — the curve reserve
 // is wSOL post-migration (§17). SOL MIGRATION (oracle-free, Phase 3+4): dimensionally lamports vs the
 // lamport reserve. Raw values kept as placeholders; the SOL-native magnitudes are a Phase-6 tunable.
@@ -5630,6 +5695,21 @@ fn split_curve_fee_3way(
 /// convention as `split_curve_fee_3way` above. F-I-9 discipline: u128 intermediate, saturating.
 fn pm_void_redeem_payout(pass_shares: u64, fail_shares: u64) -> u64 {
     ((pass_shares as u128).saturating_add(fail_shares as u128) / 2) as u64
+}
+
+/// PM2-STALE-1: `true` iff a raw pre-redesign `MarketCurve` account (exactly
+/// `PM_OLD_MARKET_CURVE_ACCOUNT_SIZE` bytes) ever held real value — i.e. any of the OLD layout's
+/// `pass_real`/`pass_shares`/`fail_real`/`fail_shares` fields is non-zero. Callers must check
+/// `data.len() == PM_OLD_MARKET_CURVE_ACCOUNT_SIZE` before calling this — it indexes fixed byte
+/// offsets and will panic on a shorter buffer. Pure/no-panic-on-valid-input so it's directly
+/// unit-testable against synthetic byte arrays, independent of any live account.
+fn pm_old_curve_has_real_value(data: &[u8]) -> bool {
+    let u64_at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let pass_real = u64_at(208);
+    let pass_shares = u64_at(216);
+    let fail_real = u64_at(232);
+    let fail_shares = u64_at(240);
+    pass_real != 0 || pass_shares != 0 || fail_real != 0 || fail_shares != 0
 }
 
 /// Decode a persisted `RiskTier` discriminant (e.g. `QueuedPayout.settlement_tier`).
@@ -9384,6 +9464,42 @@ pub struct VoidMarketCurve<'info> {
     pub curve: Box<Account<'info, MarketCurve>>,
 }
 
+/// PM2-STALE-1 remediation. `curve` is deliberately a raw `AccountInfo`, NOT `Account<'info,
+/// MarketCurve>` — a pre-redesign curve "decodes" successfully with fields sourced from the OLD
+/// layout's byte offsets rather than throwing (the whole reason this instruction exists), so the
+/// typed load path can't be trusted here: it would also re-derive the PDA using the account's
+/// GARBAGE `bump` field. The handler re-derives the expected PDA directly from `challenge` instead,
+/// and manually inspects the raw bytes before ever mutating this account. See the handler's doc
+/// comment for the full safety gate (owner check, exact-old-size check, zero-real-balance check).
+#[derive(Accounts)]
+pub struct CloseStaleMarketCurve<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(
+        seeds = [
+            b"challenge",
+            challenge.firm.as_ref(),
+            challenge.trader.as_ref(),
+            &[challenge.account_size_tier],
+            &[challenge.phase as u8],
+            &challenge.nonce.to_le_bytes(),
+        ],
+        bump = challenge.bump,
+        seeds::program = challenge::ID,
+        constraint = challenge.settlement_authority == authority.key() @ FirmError::Unauthorized,
+        constraint = challenge.firm == firm_state.key() @ FirmError::Unauthorized,
+    )]
+    pub challenge: Box<Account<'info, challenge::ChallengeState>>,
+
+    /// CHECK: see this struct's doc comment — validated manually in the handler, never deserialized
+    /// as `MarketCurve`.
+    #[account(mut)]
+    pub curve: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 #[instruction(holder: Pubkey)]
 pub struct RedeemMarketShares<'info> {
@@ -11810,6 +11926,14 @@ pub struct MarketVoided {
     pub curve: Pubkey,
 }
 
+/// PM2-STALE-1 remediation: a pre-redesign `MarketCurve` account (old 316-byte layout) closed via
+/// `close_stale_market_curve` so `init_market_curve` can recreate it fresh under the new layout.
+#[event]
+pub struct StaleMarketCurveClosed {
+    pub curve: Pubkey,
+    pub challenge: Pubkey,
+}
+
 #[event]
 pub struct MarketSharesRedeemed {
     pub curve: Pubkey,
@@ -12373,6 +12497,13 @@ pub enum FirmError {
     PmExceedsCurveInventory,
     #[msg("use redeem_void_curve_inventory for the curve's own inventory position, not redeem_void_shares")]
     PmUseCurveInventoryRedemption,
+    // Appended (PM2-STALE-1: closing pre-redesign MarketCurve accounts stranded by the CTF migration).
+    #[msg("this account is not owned by this program — not a stale curve")]
+    PmStaleCurveNotOwned,
+    #[msg("this account's size does not match the pre-redesign MarketCurve layout — refusing to touch anything that isn't exactly that known-stale shape")]
+    PmStaleCurveSizeMismatch,
+    #[msg("this pre-redesign curve holds non-zero real balance — closing it would destroy real value, refusing")]
+    PmStaleCurveNotEmpty,
 }
 
 #[cfg(test)]
@@ -14586,6 +14717,40 @@ mod tests {
                 "seed {seed}: void payouts summed to {total_paid}, exceeding vault {c}"
             );
         }
+    }
+
+    /// Builds a synthetic OLD-layout `MarketCurve` buffer (`PM_OLD_MARKET_CURVE_ACCOUNT_SIZE` bytes,
+    /// all zero except the four fields under test) so `pm_old_curve_has_real_value`'s offsets can be
+    /// verified directly, independent of any live account.
+    fn synthetic_old_curve(pass_real: u64, pass_shares: u64, fail_real: u64, fail_shares: u64) -> Vec<u8> {
+        let mut data = vec![0u8; PM_OLD_MARKET_CURVE_ACCOUNT_SIZE];
+        data[208..216].copy_from_slice(&pass_real.to_le_bytes());
+        data[216..224].copy_from_slice(&pass_shares.to_le_bytes());
+        data[232..240].copy_from_slice(&fail_real.to_le_bytes());
+        data[240..248].copy_from_slice(&fail_shares.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn pm_old_curve_has_real_value_is_false_for_an_all_zero_curve() {
+        assert!(!pm_old_curve_has_real_value(&synthetic_old_curve(0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn pm_old_curve_has_real_value_catches_any_one_of_the_four_fields() {
+        assert!(pm_old_curve_has_real_value(&synthetic_old_curve(1, 0, 0, 0)));
+        assert!(pm_old_curve_has_real_value(&synthetic_old_curve(0, 1, 0, 0)));
+        assert!(pm_old_curve_has_real_value(&synthetic_old_curve(0, 0, 1, 0)));
+        assert!(pm_old_curve_has_real_value(&synthetic_old_curve(0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn pm_old_curve_has_real_value_offsets_match_the_real_316_byte_layout() {
+        // A real production account's raw bytes are exactly PM_OLD_MARKET_CURVE_ACCOUNT_SIZE — this
+        // pins that constant against the same layout the offsets above index into, so a future change
+        // to either can't silently drift apart from the other.
+        assert_eq!(synthetic_old_curve(0, 0, 0, 0).len(), PM_OLD_MARKET_CURVE_ACCOUNT_SIZE);
+        assert_eq!(PM_OLD_MARKET_CURVE_ACCOUNT_SIZE, 316);
     }
 
     #[test]
