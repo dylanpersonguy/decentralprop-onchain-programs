@@ -3276,6 +3276,21 @@ pub mod firm {
         // settlement authority (== `firm.risk_engine_authority`, a required signer on this ix) attests
         // the quoted `price_lamports`. Same trust model the eval fee already uses (amount as arg).
         require!(price_lamports > 0, FirmError::ZeroAmount);
+        // M-4 (DEPFEE-ATA-1): bind the 20% DecentralProp leg to the canonical platform destination,
+        // the same way `pay_challenge_fee` binds its own DP legs. This was the ONLY DP fee leg left
+        // unbound after V2-6/V2-8 closed the others, and the gap was not theoretical: the gateway
+        // derived an ATA *from* the config value instead of passing it through, so 38.94 SOL of
+        // devnet deploy fees landed in an account owned by another token account, which no key can
+        // sign for. Unbound, nothing on-chain could notice. Bound, that same mistake reverts.
+        // Validated here rather than in `try_accounts` for the reason `PayChallengeFee` documents:
+        // an `UncheckedAccount` adds no deserialization to the account-validation stack frame.
+        {
+            let pc = &ctx.accounts.platform_config;
+            let (expected, _) = Pubkey::find_program_address(&[b"platform_config"], &crate::ID);
+            require!(pc.key() == expected, FirmError::Unauthorized);
+            let cfg = PlatformConfig::try_deserialize(&mut &pc.try_borrow_data()?[..])?;
+            require!(ctx.accounts.dp_sol.key() == cfg.dp_profit_sol, FirmError::Unauthorized);
+        }
         let price = price_lamports;
         let has_referrer = ctx.accounts.referrer_sol.is_some();
         let split = compute_deployment_fee_split(price, has_referrer)?;
@@ -10131,6 +10146,13 @@ pub struct PayDeploymentFee<'info> {
     )]
     pub treasury_vault: Box<Account<'info, TokenAccount>>,
 
+    // Canonical platform config (M-4) — bound in the HANDLER, not as a typed `Account`, so it costs
+    // this context nothing in account-validation stack. Same treatment as `PayChallengeFee`.
+    /// CHECK: validated in-handler (PDA identity + `dp_sol` against `dp_profit_sol`).
+    pub platform_config: UncheckedAccount<'info>,
+
+    // The 20% DecentralProp leg. `platform_config.dp_profit_sol` is the wSOL TOKEN ACCOUNT itself,
+    // not an owner to derive an ATA from — address-bound in the handler above.
     #[account(mut, token::mint = firm_state.sol_mint)]
     pub dp_sol: Box<Account<'info, TokenAccount>>,
 
