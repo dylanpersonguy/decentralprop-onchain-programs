@@ -2919,6 +2919,228 @@ pub mod firm {
     /// the SOL treasury can't fund a curve buy, the keeper draws the firm's pre-acquired
     /// `$FIRMA` (seeded at deployment) straight to the trader — no curve sale, no slippage —
     /// before touching the investor backstop. Signed by the challenge's settlement authority.
+    /// Put 16% of a firm's supply into a Streamflow vest, so the Tier-2 reserve reads as a
+    /// recognised vesting contract instead of an unlabeled whale (RESERVE-VEST-1). Permissionless,
+    /// one-shot per firm.
+    ///
+    /// ── Why this instruction exists in this program and not off-chain ──
+    /// Streamflow's `create` wants a caller-generated keypair for the stream metadata, and a program
+    /// cannot produce a keypair signature. `create_unchecked_with_payer` takes the metadata as a
+    /// NON-signer, so a pre-allocated account is accepted — and the account we pre-allocate is our
+    /// own PDA, `["reserve_vest", firm]`. That is what makes the whole vest addressable from the
+    /// firm alone, with no Prisma column and no `FirmState` field to drift.
+    ///
+    /// ── What makes it safe to leave permissionless ──
+    /// Every parameter that decides where value can go is fixed here, not supplied by the caller:
+    /// `recipient` is the firm PDA (so this program is the only possible withdrawer), the source is
+    /// the firm's own address-bound vault, and `withdrawor`/`fee_oracle`/`partner` are pinned to
+    /// measured constants. A cranker chooses nothing except whether to pay the gas.
+    ///
+    /// ── The failure mode is the status quo ──
+    /// The stream is funded straight out of `treasury_firma_vault`, so there is no staging vault and
+    /// no half-created state. If this is never called, or reverts, or is retried forever, the full
+    /// reserve simply stays liquid exactly as it does today — nothing is stranded.
+    pub fn create_reserve_vest(ctx: Context<CreateReserveVest>) -> Result<()> {
+        require!(
+            ctx.accounts.stream_metadata.data_is_empty(),
+            FirmError::ReserveVestAlreadyExists
+        );
+
+        // Size the vest off the vault's live balance. Integer-divide first and stream exactly
+        // `per_period * RESERVE_VEST_PERIODS` so the schedule ends ON the final period instead of
+        // dribbling a ragged remainder into a 181st one; the few tokens of dust stay liquid, which
+        // is the side to err on.
+        let vault_amount = ctx.accounts.treasury_firma_vault.amount;
+        require!(vault_amount > 0, FirmError::ZeroAmount);
+        let gross = u64::try_from(
+            (vault_amount as u128)
+                .checked_mul(RESERVE_VEST_BPS as u128)
+                .ok_or(FirmError::MathOverflow)?
+                / 10_000u128,
+        )
+        .map_err(|_| FirmError::MathOverflow)?;
+        let per_period = gross / RESERVE_VEST_PERIODS;
+        require!(per_period > 0, FirmError::ReserveVestTooSmall);
+        let net = per_period
+            .checked_mul(RESERVE_VEST_PERIODS)
+            .ok_or(FirmError::MathOverflow)?;
+
+        let bump = [ctx.accounts.firm_state.bump];
+        let firm_seeds = firm_signer(&ctx.accounts.firm_state.owner, &bump);
+        let firm_key = ctx.accounts.firm_state.key();
+        let md_bump = [ctx.bumps.stream_metadata];
+        let md_seeds: &[&[u8]] = &[b"reserve_vest", firm_key.as_ref(), &md_bump];
+
+        // Streamflow pays its fee into ATA(streamflow_treasury, mint) and never creates it. For a
+        // freshly-minted $FIRMA it does not exist, so make it here, once, while someone is watching
+        // — rather than discovering it months later when the first release fails unattended.
+        associated_token::create_idempotent(CpiContext::new(
+            ctx.accounts.associated_token_program.to_account_info(),
+            associated_token::Create {
+                payer: ctx.accounts.cranker.to_account_info(),
+                associated_token: ctx.accounts.streamflow_treasury_tokens.to_account_info(),
+                authority: ctx.accounts.streamflow_treasury.to_account_info(),
+                mint: ctx.accounts.firma_mint.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+        ))?;
+
+        // **Streamflow will only accept an ASSOCIATED token account as `sender_tokens`** — anything
+        // else is refused with "Provided account(s) is/are not valid associated token accounts"
+        // (custom error 0x65). `treasury_firma_vault` is a seeded PDA vault, not an ATA, so the
+        // reserve cannot be streamed out of it directly.
+        //
+        // The vest therefore stages through ATA(firm_state, mint) — the SAME account
+        // `release_vested_reserve` receives withdrawals into. Empty at rest in both directions:
+        // filled and drained inside this instruction on the way in, swept into the vault by the
+        // release on the way out.
+        associated_token::create_idempotent(CpiContext::new(
+            ctx.accounts.associated_token_program.to_account_info(),
+            associated_token::Create {
+                payer: ctx.accounts.cranker.to_account_info(),
+                associated_token: ctx.accounts.sender_tokens.to_account_info(),
+                authority: ctx.accounts.firm_state.to_account_info(),
+                mint: ctx.accounts.firma_mint.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+        ))?;
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.treasury_firma_vault.to_account_info(),
+                    to: ctx.accounts.sender_tokens.to_account_info(),
+                    authority: ctx.accounts.firm_state.to_account_info(),
+                },
+                &[&firm_seeds],
+            ),
+            gross,
+        )?;
+
+        // Allocate the metadata ourselves, owned by Streamflow, signing as our own PDA. The cranker
+        // funds it: `create_unchecked_with_payer` never charges the sender, which is the whole
+        // reason this variant is the one that works here.
+        let rent = Rent::get()?;
+        anchor_lang::system_program::create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.cranker.to_account_info(),
+                    to: ctx.accounts.stream_metadata.to_account_info(),
+                },
+                &[md_seeds],
+            ),
+            rent.minimum_balance(STREAM_METADATA_LEN),
+            STREAM_METADATA_LEN as u64,
+            &ctx.accounts.streamflow_program.key(),
+        )?;
+
+        // `create_unchecked_with_payer` — 18 args, borsh-encoded in IDL order. Hand-encoded for the
+        // same reason `release_vested_reserve` hand-encodes `withdraw`: adding their crate as a
+        // dependency would put a third-party build in the path of every compile of the 2 MB program.
+        let now = Clock::get()?.unix_timestamp as u64;
+        let mut stream_name = [0u8; 64];
+        let label = b"DecentralProp Tier-2 payout reserve";
+        stream_name[..label.len()].copy_from_slice(label);
+
+        let mut data = Vec::with_capacity(200);
+        data.extend_from_slice(&STREAMFLOW_CREATE_UNCHECKED_WITH_PAYER_DISCRIMINATOR);
+        data.extend_from_slice(&now.saturating_add(1).to_le_bytes()); // start_time
+        data.extend_from_slice(&net.to_le_bytes()); // net_amount_deposited
+        data.extend_from_slice(&RESERVE_VEST_PERIOD_SECS.to_le_bytes()); // period
+        data.extend_from_slice(&per_period.to_le_bytes()); // amount_per_period
+        data.extend_from_slice(&0u64.to_le_bytes()); // cliff
+        data.extend_from_slice(&0u64.to_le_bytes()); // cliff_amount
+        data.push(0); // cancelable_by_sender  — irrevocable, or the lock is only a promise
+        data.push(0); // cancelable_by_recipient
+        data.push(0); // automatic_withdrawal  — our own keeper cranks it
+        data.push(0); // transferable_by_sender
+        data.push(0); // transferable_by_recipient
+        data.push(0); // can_topup
+        data.extend_from_slice(&stream_name); // [u8; 64], no length prefix
+        data.extend_from_slice(&0u64.to_le_bytes()); // withdraw_frequency
+        data.extend_from_slice(firm_key.as_ref()); // recipient — the firm PDA, so only we can withdraw
+        data.extend_from_slice(firm_key.as_ref()); // partner — ourselves, so any partner fee comes back
+        data.push(0); // pausable
+        data.push(0); // can_update_rate
+
+        let metas = vec![
+            AccountMeta::new(ctx.accounts.cranker.key(), true),        // payer
+            AccountMeta::new(firm_key, true),                          // sender
+            AccountMeta::new(ctx.accounts.sender_tokens.key(), false), // sender_tokens
+            AccountMeta::new(ctx.accounts.stream_metadata.key(), false),
+            AccountMeta::new(ctx.accounts.escrow_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.withdrawor.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.firma_mint.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.fee_oracle.key(), false),
+            AccountMeta::new_readonly(anchor_lang::solana_program::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(ctx.accounts.streamflow_program.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+        ];
+        let ix = anchor_lang::solana_program::instruction::Instruction {
+            program_id: ctx.accounts.streamflow_program.key(),
+            accounts: metas,
+            data,
+        };
+        anchor_lang::solana_program::program::invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.cranker.to_account_info(),
+                ctx.accounts.firm_state.to_account_info(),
+                ctx.accounts.sender_tokens.to_account_info(),
+                ctx.accounts.stream_metadata.to_account_info(),
+                ctx.accounts.escrow_tokens.to_account_info(),
+                ctx.accounts.withdrawor.to_account_info(),
+                ctx.accounts.firma_mint.to_account_info(),
+                ctx.accounts.fee_oracle.to_account_info(),
+                ctx.accounts.rent.to_account_info(),
+                ctx.accounts.streamflow_program.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[&firm_seeds, md_seeds],
+        )?;
+
+        // Whatever Streamflow did not take — the sub-tranche dust, plus any fee headroom it did not
+        // need — goes straight back to the vault rather than sitting in a staging account nothing
+        // else reads. Decoded by offset because `sender_tokens` is an `UncheckedAccount` (it may not
+        // exist at validation time, since the handler creates it): SPL amount is a u64 LE at byte 64.
+        let leftover = {
+            let data = ctx.accounts.sender_tokens.try_borrow_data()?;
+            if data.len() >= 72 {
+                u64::from_le_bytes(data[64..72].try_into().unwrap())
+            } else {
+                0
+            }
+        };
+        if leftover > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.sender_tokens.to_account_info(),
+                        to: ctx.accounts.treasury_firma_vault.to_account_info(),
+                        authority: ctx.accounts.firm_state.to_account_info(),
+                    },
+                    &[&firm_seeds],
+                ),
+                leftover,
+            )?;
+        }
+
+        emit!(ReserveVestCreated {
+            firm: firm_key,
+            stream: ctx.accounts.stream_metadata.key(),
+            net_amount: net,
+            amount_per_period: per_period,
+            period_secs: RESERVE_VEST_PERIOD_SECS,
+        });
+        Ok(())
+    }
+
     /// Pull vested Tier-2 reserve out of its Streamflow vest and into the firm's payout vault
     /// (RESERVE-VEST-1). Permissionless.
     ///
@@ -4858,6 +5080,65 @@ pub const STREAMFLOW_PROGRAM_ID: Pubkey = pubkey!("HqDGZjaVRXJ9MGRQEw7qDc2rAr6iH
 pub const STREAMFLOW_PROGRAM_ID: Pubkey = pubkey!("strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m");
 
 pub const STREAMFLOW_WITHDRAW_DISCRIMINATOR: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
+pub const STREAMFLOW_CREATE_UNCHECKED_WITH_PAYER_DISCRIMINATOR: [u8; 8] =
+    [0, 123, 85, 155, 20, 111, 159, 22];
+
+/// Streamflow's own infrastructure accounts. Pinned here — rather than letting the permissionless
+/// cranker pass whatever it likes — so a caller cannot name a `fee_oracle` of its own and price a
+/// firm's reserve away from it.
+///
+/// The withdrawor and treasury ARE the same on both clusters. **The fee oracle is not**, and getting
+/// that wrong is what made the first three attempts at this instruction fail with a bare
+/// `InvalidAccountData` that named nothing. The trap: sampling one OLD `create` transaction per
+/// cluster shows the same oracle on both and reads like proof they are shared. They are not — devnet
+/// has since migrated to a new oracle under a different owning program (`pardoTar…` rather than
+/// `pardpVtP…`) while mainnet still uses the original. Both values below come from the **most recent
+/// successful `create` transactions on each cluster** (10/10 devnet, 5/5 mainnet, unanimous), which
+/// is the only sampling that distinguishes "shared" from "not yet migrated".
+pub const STREAMFLOW_WITHDRAWOR: Pubkey = pubkey!("wdrwhnCv4pzW8beKsbPa4S2UDZrXenjg16KJdKSpb5u");
+pub const STREAMFLOW_TREASURY: Pubkey = pubkey!("5SEpbdjFK5FxwTvfsGMXVQTD2v4M2c5tyRTxhdsPkgDw");
+#[cfg(feature = "streamflow-devnet")]
+pub const STREAMFLOW_FEE_ORACLE: Pubkey = pubkey!("Aa2JJfFzUN3V54DXUHRBJowFw416xfZHpPk9DaNy3iYs");
+#[cfg(not(feature = "streamflow-devnet"))]
+pub const STREAMFLOW_FEE_ORACLE: Pubkey = pubkey!("B743wFVk2pCYhV91cn287e1xY7f1vt4gdY48hhNiuQmT");
+
+/// Streamflow stream metadata is 1104 bytes. `create_unchecked_with_payer` takes the metadata as a
+/// NON-signer and accepts an account the caller allocated — confirmed by a real devnet round-trip,
+/// which is the detail this whole instruction was gated on. That is what lets a program create a
+/// stream at all: it cannot produce a keypair signature, but it can sign for its own PDA.
+///
+/// Its sibling `create` cannot be used here for a reason that is invisible until you run it: `create`
+/// pays the metadata rent with a SYSTEM transfer from the SENDER, and the System program refuses
+/// `Transfer: "from" must not carry data`. Our sender is an Anchor account. The `_with_payer` variant
+/// takes a separate payer — the cranker, a plain wallet — which is precisely why it exists.
+pub const STREAM_METADATA_LEN: usize = 1104;
+
+/// Escrow seed prefix. Streamflow derives a stream's escrow token account as
+/// `["strm", metadata]` under their program — **verified against three real streams on two
+/// clusters**, not from documentation. An earlier reading of their source recorded this as
+/// `[metadata]` with no prefix, which derives an address that exists nowhere (`ESCROW-SEED-1`).
+pub const STREAMFLOW_ESCROW_SEED: &[u8] = b"strm";
+
+/// ── The Tier-2 reserve vest (RESERVE-VEST-1) ──
+/// 20% of a firm's supply is minted into `treasury_firma_vault` at deployment. `create_reserve_vest`
+/// streams **80% of that vault — 16% of supply — over 180 days**, leaving 4% of supply liquid for
+/// payouts that land before the vest has released anything. SIM 16 measured the cost of that time
+/// lock at ~$11 per firm over three years with zero insolvencies.
+pub const RESERVE_VEST_BPS: u16 = 8_000;
+/// One tranche per day, for 180 days. A daily period (rather than per-second) keeps the numbers
+/// legible on the explorers this whole feature exists to satisfy.
+///
+/// **The devnet build compresses this to one tranche per minute (3 hours total).** Same reason
+/// `challenge` carries `devnet-fast`: a 180-day schedule releases NOTHING for 24 hours, so
+/// `release_vested_reserve` could never be proven against real bytecode — only described. It rides
+/// the existing `streamflow-devnet` feature rather than inventing a second flag, because the two
+/// always want the same answer: a devnet build needs the devnet program ID *and* a schedule short
+/// enough to observe. A mainnet build carries neither.
+#[cfg(feature = "streamflow-devnet")]
+pub const RESERVE_VEST_PERIOD_SECS: u64 = 60;
+#[cfg(not(feature = "streamflow-devnet"))]
+pub const RESERVE_VEST_PERIOD_SECS: u64 = 86_400;
+pub const RESERVE_VEST_PERIODS: u64 = 180;
 
 pub const FIRMA_DECIMALS: u8 = 6;
 /// Highest deployment tier index (0 Starter … 4 Enterprise).
@@ -10189,6 +10470,95 @@ impl<'info> SweepCurveFeesToPool<'info> {
 
 // Accounts are Box'd to keep the BPF stack frame under 4 KB.
 #[derive(Accounts)]
+pub struct CreateReserveVest<'info> {
+    /// Permissionless cranker. Pays the rent for the stream metadata and Streamflow's fee ATA, and
+    /// chooses nothing else — every destination in this instruction is fixed by seeds or by a pinned
+    /// constant.
+    #[account(mut)]
+    pub cranker: Signer<'info>,
+
+    /// The stream's SENDER and, by the `recipient` argument below, also its recipient. Streamflow's
+    /// `withdraw` demands authority == recipient, so naming the firm PDA both makes this program the
+    /// only thing that can ever drain the vest.
+    #[account(mut, seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    /// The Tier-2 reserve the stream is funded out of. Address-bound to the firm's own canonical
+    /// vault, so a cranker cannot point the deposit at some other token account.
+    #[account(
+        mut,
+        seeds = [b"treasury_firma_vault", firm_state.key().as_ref()],
+        bump,
+    )]
+    pub treasury_firma_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    /// ATA(firm_state, firma_mint) — the staging hop into the stream. Streamflow refuses any
+    /// `sender_tokens` that is not an associated token account, so the reserve cannot be streamed
+    /// straight out of the seeded vault above. Created idempotently and left empty: it is filled and
+    /// drained inside this instruction, and is the same account `release_vested_reserve` sweeps out
+    /// of on the way back.
+    ///
+    /// CHECK: created by the ATA program in the handler, so it may not exist at validation time;
+    /// its address is fixed by the associated-token derivation, which is why nothing here is
+    /// caller-chosen.
+    #[account(mut)]
+    pub sender_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: allocated by this instruction at `STREAM_METADATA_LEN` and handed to Streamflow to
+    /// populate. Ours by seed, theirs by owner — which is the whole trick that lets a program create
+    /// a stream at a deterministic address.
+    #[account(mut, seeds = [b"reserve_vest", firm_state.key().as_ref()], bump)]
+    pub stream_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's escrow for this stream, created inside their CPI. Validated here against
+    /// their real seed recipe (`["strm", metadata]`, measured on both clusters) rather than trusted
+    /// from the caller — see `ESCROW-SEED-1` for why that recipe is not taken on faith.
+    #[account(
+        mut,
+        seeds = [STREAMFLOW_ESCROW_SEED, stream_metadata.key().as_ref()],
+        bump,
+        seeds::program = STREAMFLOW_PROGRAM_ID,
+    )]
+    pub escrow_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's withdrawor, pinned to the measured address so a caller cannot substitute
+    /// its own.
+    #[account(mut, address = STREAMFLOW_WITHDRAWOR)]
+    pub withdrawor: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's fee oracle, pinned. This is the account that decides the stream's fee
+    /// percentage — leaving it caller-supplied on a permissionless instruction would be a way to
+    /// price a firm's own reserve away from it.
+    #[account(address = STREAMFLOW_FEE_ORACLE)]
+    pub fee_oracle: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's fee treasury, pinned. Also the stream's `partner`, which is what their
+    /// own client does when a stream has no partner. **`mut` is load-bearing** — the CPI passes it
+    /// writable, and a program cannot grant a privilege its own context does not hold ("writable
+    /// privilege escalated").
+    #[account(mut, address = STREAMFLOW_TREASURY)]
+    pub streamflow_treasury: UncheckedAccount<'info>,
+
+    /// CHECK: ATA(streamflow_treasury, firma_mint), created idempotently here. Streamflow pays its
+    /// fee into this at withdraw time and never creates it, so without this the FIRST release would
+    /// fail on a missing account — months later, unattended.
+    #[account(mut)]
+    pub streamflow_treasury_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: the Streamflow program, pinned to the address for this cluster.
+    #[account(address = STREAMFLOW_PROGRAM_ID)]
+    pub streamflow_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
 pub struct ReleaseVestedReserve<'info> {
     /// Permissionless cranker — pays gas only. The tokens can land nowhere but the firm's own vault.
     pub cranker: Signer<'info>,
@@ -10211,7 +10581,10 @@ pub struct ReleaseVestedReserve<'info> {
     #[account(mut, token::mint = firma_mint, token::authority = firm_state)]
     pub recipient_tokens: Box<Account<'info, TokenAccount>>,
 
-    #[account(address = firm_state.firma_mint)]
+    /// `withdraw` takes the mint WRITABLE in Streamflow's IDL, so this must be `mut` — the CPI
+    /// already passed it writable, and the runtime rejects granting a privilege the caller's own
+    /// context lacks. Latent until this instruction was first executed for real.
+    #[account(mut, address = firm_state.firma_mint)]
     pub firma_mint: Box<Account<'info, Mint>>,
 
     /// CHECK: the stream's metadata account. Validated by Streamflow itself, which checks it belongs
@@ -12769,6 +13142,15 @@ pub struct FirmaRouted {
 
 /// A tranche of the Tier-2 reserve moved from its vest into the firm's payout vault.
 #[event]
+pub struct ReserveVestCreated {
+    pub firm: Pubkey,
+    pub stream: Pubkey,
+    pub net_amount: u64,
+    pub amount_per_period: u64,
+    pub period_secs: u64,
+}
+
+#[event]
 pub struct VestedReserveReleased {
     pub firm: Pubkey,
     pub amount: u64,
@@ -13020,6 +13402,12 @@ pub enum FirmError {
     VelocityBreakPayoutsOutstanding,
     #[msg("this firm's treasury vault holds no more than insolvency dust — the breaker is doing its job, refusing to clear it")]
     VelocityBreakTreasuryUnproven,
+    // Appended (RESERVE-VEST-1). Never insert above this line — Anchor derives error codes from
+    // variant position, so an insertion silently renumbers every code below it.
+    #[msg("this firm already has a Tier-2 reserve vest — the stream metadata PDA exists")]
+    ReserveVestAlreadyExists,
+    #[msg("this firm's reserve is too small to vest — one period's tranche would round to zero")]
+    ReserveVestTooSmall,
 }
 
 #[cfg(test)]
@@ -13050,6 +13438,83 @@ mod tests {
         assert_eq!(STREAMFLOW_PROGRAM_ID, devnet);
         #[cfg(not(feature = "streamflow-devnet"))]
         assert_eq!(STREAMFLOW_PROGRAM_ID, mainnet);
+    }
+
+    #[test]
+    fn streamflow_create_unchecked_with_payer_discriminator_matches_anchors_derivation() {
+        // Re-derived from Anchor's own rule rather than re-reading the constant: sighash of
+        // `global:<name>`. If Streamflow ever renames the instruction this fails loudly instead of
+        // encoding a discriminator that silently hits nothing.
+        let mut hasher = anchor_lang::solana_program::hash::Hasher::default();
+        hasher.hash(b"global:create_unchecked_with_payer");
+        let expected: [u8; 8] = hasher.result().to_bytes()[..8].try_into().unwrap();
+        assert_eq!(
+            STREAMFLOW_CREATE_UNCHECKED_WITH_PAYER_DISCRIMINATOR, expected,
+            "create_unchecked_with_payer discriminator drifted from Anchor's derivation"
+        );
+    }
+
+    #[test]
+    fn streamflow_escrow_seed_reproduces_a_real_stream_on_this_cluster() {
+        // Three real streams, pulled from their own `create` transactions (two devnet, one
+        // mainnet). The prefix-less `[metadata]` recipe this originally shipped with derives an
+        // address that exists on neither cluster (ESCROW-SEED-1), so the recipe is pinned against
+        // observed addresses instead of against a source reading.
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "HqDGZjaVRXJ9MGRQEw7qDc2rAr6iH1n1kAQdCZaCMfMZ",
+                "JEJQ7s8pe3y18s2P4HPbfn2XswBZKAzJRoJx7vw4shCK",
+                "4sbH8pnNn3uJgcCw6Q5q6gmtJrQnuHd56Q3jHa2bjoR9",
+            ),
+            (
+                "HqDGZjaVRXJ9MGRQEw7qDc2rAr6iH1n1kAQdCZaCMfMZ",
+                "JEJRB6f4H5ChCD1xcYsG1NFupRKqQQxTUm5QoqNMsE3C",
+                "2DwWwpNZNFubQ9jMzvf1kUUuYyeYvmxCY465xnutr5jd",
+            ),
+            (
+                "strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m",
+                "JEEoQdHX66dhW5LqsQPsF1N2CNfhTaCGjogHUAQj8SP8",
+                "DDbrNMrZdBz85TBvX74AjAoLrLEYStfb2iGbtKXmXD6k",
+            ),
+        ];
+        for (program, metadata, escrow) in cases {
+            let program: Pubkey = program.parse().unwrap();
+            let metadata: Pubkey = metadata.parse().unwrap();
+            let (derived, _) =
+                Pubkey::find_program_address(&[STREAMFLOW_ESCROW_SEED, metadata.as_ref()], &program);
+            assert_eq!(derived.to_string(), escrow, "escrow recipe wrong for {metadata}");
+        }
+    }
+
+    #[test]
+    fn reserve_vest_sizing_leaves_four_percent_of_supply_liquid_and_ends_on_the_last_period() {
+        // The vault holds 20% of supply; 80% of the vault is 16% of supply.
+        let supply: u64 = 1_000_000_000_000_000; // 1B tokens at 6dp
+        let vault = supply / 5; // 20%
+        let gross = (vault as u128) * RESERVE_VEST_BPS as u128 / 10_000;
+        let per_period = (gross / RESERVE_VEST_PERIODS as u128) as u64;
+        let net = per_period * RESERVE_VEST_PERIODS;
+
+        // 16% of supply vests, to within one period's rounding dust.
+        assert!(net <= supply * 16 / 100);
+        assert!(net >= supply * 16 / 100 - RESERVE_VEST_PERIODS);
+        // and 4% of supply stays liquid, never less.
+        assert!(vault - net >= supply * 4 / 100);
+        // The deposit is an exact multiple of the tranche, so the stream ends ON period 180 rather
+        // than dribbling a remainder into a 181st.
+        assert_eq!(net % per_period, 0);
+        assert_eq!(net / per_period, RESERVE_VEST_PERIODS);
+    }
+
+    #[test]
+    fn reserve_vest_schedule_is_compressed_only_on_devnet() {
+        if cfg!(feature = "streamflow-devnet") {
+            assert_eq!(RESERVE_VEST_PERIOD_SECS, 60);
+        } else {
+            assert_eq!(RESERVE_VEST_PERIOD_SECS, 86_400);
+            // 180 daily tranches — the six months SIM 16 actually measured.
+            assert_eq!(RESERVE_VEST_PERIOD_SECS * RESERVE_VEST_PERIODS, 180 * 86_400);
+        }
     }
 
 
