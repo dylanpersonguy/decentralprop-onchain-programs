@@ -2932,9 +2932,13 @@ pub mod firm {
     ///
     /// ── What makes it safe to leave permissionless ──
     /// Every parameter that decides where value can go is fixed here, not supplied by the caller:
-    /// `recipient` is the firm PDA (so this program is the only possible withdrawer), the source is
-    /// the firm's own address-bound vault, and `withdrawor`/`fee_oracle`/`partner` are pinned to
-    /// measured constants. A cranker chooses nothing except whether to pay the gas.
+    /// `recipient` is the firm PDA (so the vest can only ever pay this firm), the source is the
+    /// firm's own address-bound vault, and `withdrawor`/`fee_oracle`/`partner` are pinned to measured
+    /// constants. A cranker chooses nothing except whether to pay the gas.
+    ///
+    /// It is NOT the case that this program is the only thing that can trigger a withdraw —
+    /// Streamflow's withdrawor can too. See `sweep_reserve_ata` for what that costs and how it is
+    /// handled.
     ///
     /// ── The failure mode is the status quo ──
     /// The stream is funded straight out of `treasury_firma_vault`, so there is no staging vault and
@@ -2970,6 +2974,25 @@ pub mod firm {
         let firm_key = ctx.accounts.firm_state.key();
         let md_bump = [ctx.bumps.stream_metadata];
         let md_seeds: &[&[u8]] = &[b"reserve_vest", firm_key.as_ref(), &md_bump];
+
+        // Both token accounts below are `UncheckedAccount` — they may not exist when the instruction
+        // is validated, because this handler creates them. The ATA program does validate the address
+        // it is handed, so these are already safe; the checks are here so that safety does not depend
+        // on a CPI happening to run BEFORE the transfer that follows it. Cheap, and it makes the
+        // invariant local instead of emergent.
+        require_keys_eq!(
+            ctx.accounts.sender_tokens.key(),
+            associated_token::get_associated_token_address(&firm_key, &ctx.accounts.firma_mint.key()),
+            FirmError::Unauthorized
+        );
+        require_keys_eq!(
+            ctx.accounts.streamflow_treasury_tokens.key(),
+            associated_token::get_associated_token_address(
+                &STREAMFLOW_TREASURY,
+                &ctx.accounts.firma_mint.key()
+            ),
+            FirmError::Unauthorized
+        );
 
         // Streamflow pays its fee into ATA(streamflow_treasury, mint) and never creates it. For a
         // freshly-minted $FIRMA it does not exist, so make it here, once, while someone is watching
@@ -3141,6 +3164,53 @@ pub mod firm {
         Ok(())
     }
 
+    /// Move the reserve's staging ATA into the payout vault. Permissionless, idempotent, no-op at
+    /// zero — and the reason it exists is not obvious, so: **Streamflow's `withdrawor` can withdraw a
+    /// stream WITHOUT the recipient's signature.**
+    ///
+    /// That was verified the hard way rather than assumed. A test stream created with
+    /// `automatic_withdrawal: false` was fully drained 15 seconds after it completed, by
+    /// `wdrwhnCv4pzW8beKsbPa4S2UDZrXenjg16KJdKSpb5u` signing as `authority` and passing
+    /// `u64::MAX` — the recipient never signed anything. So the claim that "authority == recipient
+    /// means this program is the only possible withdrawer" is **false**: their withdrawor is a second
+    /// door. It is a benign one (it can only ever pay the stream's recipient, which is the firm PDA),
+    /// but it is a door, and it changes where the tokens end up.
+    ///
+    /// A Streamflow withdraw pays the RECIPIENT'S ATA. `release_vested_reserve` sweeps that ATA into
+    /// `treasury_firma_vault` in the same instruction, so when WE crank it the tokens land where the
+    /// payout path looks. When the withdrawor cranks it, nothing sweeps: the tokens sit in
+    /// ATA(firm, mint), which `draw_treasury_firma` does not read and `firm-reserves.ts` does not
+    /// count. The Tier-2 reserve would be silently invisible to both the payout waterfall and the
+    /// ARE — present on chain, absent from every decision that depends on it.
+    ///
+    /// This instruction is the recovery, and it is deliberately independent of the stream: it does
+    /// not care who withdrew, when, or whether the escrow still exists.
+    pub fn sweep_reserve_ata(ctx: Context<SweepReserveAta>) -> Result<()> {
+        let amount = ctx.accounts.reserve_ata.amount;
+        if amount == 0 {
+            return Ok(()); // nothing stranded — a no-op, not an error, so a keeper can call it freely
+        }
+        let bump = [ctx.accounts.firm_state.bump];
+        let seeds = firm_signer(&ctx.accounts.firm_state.owner, &bump);
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.reserve_ata.to_account_info(),
+                    to: ctx.accounts.treasury_firma_vault.to_account_info(),
+                    authority: ctx.accounts.firm_state.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+        )?;
+        emit!(ReserveAtaSwept {
+            firm: ctx.accounts.firm_state.key(),
+            amount,
+        });
+        Ok(())
+    }
+
     /// Pull vested Tier-2 reserve out of its Streamflow vest and into the firm's payout vault
     /// (RESERVE-VEST-1). Permissionless.
     ///
@@ -3153,11 +3223,18 @@ pub mod firm {
     /// and 16% arrives over six months, reading as locked from the day the pool opens.
     ///
     /// ── Why the recipient is a PDA and not the firm owner ──
-    /// Streamflow's `withdraw` requires a signature from an authority that EQUALS the recipient
-    /// (`withdraw_authority.is_signer` && `withdraw_authority.key == recipient.key`). Naming the firm
-    /// PDA as recipient means this program is the only thing in existence that can produce that
-    /// signature, so the vest cannot be drained around us — there is no other door. Streamflow holds
-    /// the safe; we keep the key.
+    /// Streamflow's `withdraw` normally requires an authority that EQUALS the recipient, so naming
+    /// the firm PDA as recipient means no third party can redirect the vest: the tokens can only ever
+    /// reach the recipient, and the recipient is us.
+    ///
+    /// **Correction (2026-08-22): that is not the same as "there is no other door", which is what
+    /// this comment used to claim.** Streamflow's `withdrawor`
+    /// (`wdrwhnCv4pzW8beKsbPa4S2UDZrXenjg16KJdKSpb5u`) CAN withdraw a stream with no signature from
+    /// the recipient — observed on devnet draining a completed stream 15 seconds after it finished,
+    /// signing as `authority` with `u64::MAX`, on a stream created `automatic_withdrawal: false`.
+    /// What that door cannot do is send the tokens anywhere other than the recipient's ATA, so it is
+    /// a liveness/accounting concern rather than a custody one — and `sweep_reserve_ata` is what
+    /// resolves it. Do not restate the original claim; it is wrong.
     ///
     /// Permissionless because the tokens can only ever land in the firm's own payout vault: a cranker
     /// gains nothing by calling it and the firm loses nothing, so gating it would only create a way
@@ -10559,6 +10636,37 @@ pub struct CreateReserveVest<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SweepReserveAta<'info> {
+    /// Permissionless cranker — pays gas only. The tokens can move nowhere but the firm's own vault.
+    pub cranker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(
+        mut,
+        seeds = [b"treasury_firma_vault", firm_state.key().as_ref()],
+        bump,
+    )]
+    pub treasury_firma_vault: Box<Account<'info, TokenAccount>>,
+
+    /// ATA(firm_state, firma_mint) — the staging account a Streamflow withdraw pays into. Constrained
+    /// as a real ATA rather than "any token account the firm happens to own", so a cranker cannot
+    /// nominate some other account for the sweep to drain.
+    #[account(
+        mut,
+        associated_token::mint = firma_mint,
+        associated_token::authority = firm_state,
+    )]
+    pub reserve_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct ReleaseVestedReserve<'info> {
     /// Permissionless cranker — pays gas only. The tokens can land nowhere but the firm's own vault.
     pub cranker: Signer<'info>,
@@ -13142,6 +13250,12 @@ pub struct FirmaRouted {
 
 /// A tranche of the Tier-2 reserve moved from its vest into the firm's payout vault.
 #[event]
+pub struct ReserveAtaSwept {
+    pub firm: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
 pub struct ReserveVestCreated {
     pub firm: Pubkey,
     pub stream: Pubkey,
@@ -13504,6 +13618,21 @@ mod tests {
         // than dribbling a remainder into a 181st.
         assert_eq!(net % per_period, 0);
         assert_eq!(net / per_period, RESERVE_VEST_PERIODS);
+    }
+
+    #[test]
+    fn reserve_vest_stages_through_the_canonical_ata_for_both_parties() {
+        // `sender_tokens` and `streamflow_treasury_tokens` are UncheckedAccounts, so their addresses
+        // are asserted in the handler rather than by Anchor. This pins the derivation those asserts
+        // use, so a future edit cannot quietly point the staging hop at some other account.
+        let firm: Pubkey = "GhfjqaR9oJEWGgjRycoxnDp8419RStNWG5CDToYuofYa".parse().unwrap();
+        let mint: Pubkey = "AsuVaeQpV7hsPAzQNZDxt1r2fiBPBSfEa2rehDwv3Xfq".parse().unwrap();
+        // The real devnet-proven pair: ATA(firm, mint) is what create/release both use.
+        let sender = associated_token::get_associated_token_address(&firm, &mint);
+        assert_ne!(sender, firm);
+        // and the fee ATA belongs to Streamflow's treasury, never to us
+        let fee_ata = associated_token::get_associated_token_address(&STREAMFLOW_TREASURY, &mint);
+        assert_ne!(fee_ata, sender);
     }
 
     #[test]
