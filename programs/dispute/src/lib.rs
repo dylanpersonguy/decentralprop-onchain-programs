@@ -16,7 +16,7 @@ declare_id!("3BTD73nYinwAf3pWR1Fw5H9avyq7dYopVARkmYi9245H");
 solana_security_txt::security_txt! {
     name: "DecentralProp: Dispute",
     project_url: "https://decentralprop.com",
-    contacts: "email:security@decentralprop.com",
+    contacts: "email:info@decentralprop.com",
     policy: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/blob/main/SECURITY.md",
     preferred_languages: "en",
     source_code: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/tree/main/programs/dispute",

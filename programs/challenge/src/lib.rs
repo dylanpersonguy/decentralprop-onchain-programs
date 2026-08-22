@@ -19,7 +19,7 @@ declare_id!("ENyhfPtpY1BPDFfdMmrUa4XJxuqXSeejgtGBHhhJsEBR");
 solana_security_txt::security_txt! {
     name: "DecentralProp: Challenge",
     project_url: "https://decentralprop.com",
-    contacts: "email:security@decentralprop.com",
+    contacts: "email:info@decentralprop.com",
     policy: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/blob/main/SECURITY.md",
     preferred_languages: "en",
     source_code: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/tree/main/programs/challenge",
@@ -46,6 +46,16 @@ const FIRM_STATE_DISCRIMINATOR: [u8; 8] = [79, 104, 191, 39, 34, 238, 54, 105];
 /// `Pubkey`, occupying `[40, 72)`. FirmState is append-only (K-1 rotation, bond, token fields are all
 /// appended AFTER `bump`), so the offset of these two LEADING fields is stable across every migration.
 const FIRM_RISK_ENGINE_AUTHORITY_OFFSET: usize = 40;
+
+/// KEEPER-API-1. Anchor discriminator for `firm::FirmProvisioning` = `sha256("account:FirmProvisioning")[..8]`.
+/// Pinned for the same reason as `FIRM_STATE_DISCRIMINATOR`: this account is read from raw bytes, so the
+/// discriminator is the only thing stopping a different firm-program-owned account being read as one.
+const FIRM_PROVISIONING_DISCRIMINATOR: [u8; 8] = [172, 174, 60, 58, 194, 17, 87, 205];
+
+/// Byte offset of `FirmProvisioning.provisioning_authority`: 8 (Anchor disc) + 32 (`firm: Pubkey`).
+/// Unlike `FirmState`'s leading fields, this account is NEW and small, so the offset is stable by virtue
+/// of nothing having been appended yet — `onchain-account-compat.test.ts` fails if that ever changes.
+const FIRM_PROVISIONING_AUTHORITY_OFFSET: usize = 40;
 
 /// DecentralProp `challenge_program` (architecture §6, §8, §10, §19).
 ///
@@ -91,24 +101,40 @@ pub mod challenge {
         let now = Clock::get()?.unix_timestamp;
         let trader = ctx.accounts.trader.key();
         let firm = ctx.accounts.firm.key();
-        let settlement_authority = ctx.accounts.settlement_authority.key();
+        let attestor = ctx.accounts.settlement_authority.key();
         // F2 (SETTLEMENT-AUTH-MINT-GUARD): bind the challenge's frozen `settlement_authority` to the
         // firm's LIVE `risk_engine_authority` AT MINT. A mismatch here produces a challenge that is
         // permanently unpayable (the firm payout gate reverts `Unauthorized` forever), so a funded such
         // account's SOL would be stuck; rejecting it at creation makes that state unconstructable. `firm`
         // is a PDA-seed account elsewhere — here it is additionally read for its keeper.
-        require_keys_eq!(
-            settlement_authority,
-            firm_risk_engine_authority(&ctx.accounts.firm.to_account_info())?,
-            ChallengeError::SettlementAuthorityMismatch
-        );
+        let risk_engine = firm_risk_engine_authority(&ctx.accounts.firm.to_account_info())?;
+        // KEEPER-API-1: WHO MAY ATTEST is now broader than WHAT GETS FROZEN, and that gap is the whole
+        // point. The signer may be the risk-engine authority or — if the firm has designated one — its
+        // provisioning authority; the challenge always freezes `risk_engine`, never the signer.
+        //
+        // Freezing the signer is what forced the public-facing gateway to hold `risk_engine_authority`:
+        // `challenge.settlement_authority` is the ONLY key `propose_settlement` accepts, so whoever
+        // co-signs a mint would also be the only party able to claim that trader's outcome. Now a
+        // provisioning key can mint an evaluation and can never claim its result or move its money —
+        // a leak of it buys the ability to create evaluations, nothing more.
+        //
+        // The provisioning account arrives via `remaining_accounts` rather than as an `Option` account so
+        // that clients built against the previous IDL keep working unchanged: they send nothing here and
+        // get exactly the old behaviour (attestation by the risk-engine authority only). That also means
+        // the program can be redeployed before the gateway without a window where purchases fail.
+        let attested = attestor == risk_engine
+            || match ctx.remaining_accounts.first() {
+                Some(prov) => firm_provisioning_authority(prov, &firm)? == attestor,
+                None => false,
+            };
+        require!(attested, ChallengeError::SettlementAuthorityMismatch);
         let bump = ctx.bumps.challenge;
         let challenge = &mut ctx.accounts.challenge;
         init_challenge_state(
             challenge,
             trader,
             firm,
-            settlement_authority,
+            risk_engine,
             account_size_tier,
             phase,
             rules,
@@ -1537,6 +1563,135 @@ pub mod challenge {
         );
         Ok(())
     }
+
+    /// Permissionless layout migration — the escape hatch `ChallengeState` did not have on
+    /// 2026-08-10, when `nonce` was appended to it and thirty live devnet challenges became
+    /// undeserializable (MASTER_FIXES PROPOSE-TERMINAL-1/2).
+    ///
+    /// Grows a `ChallengeState` written under an older, SMALLER layout up to the current
+    /// `8 + ChallengeState::INIT_SPACE`, zero-filling the appended bytes. It mirrors `firm`'s
+    /// `migrate_firm_permissionless`: no authority is granted, no value moves, and the only signer
+    /// is whoever pays the rent delta. That is what makes it safe to leave callable forever —
+    /// repairing someone else's account is not a privilege worth gating, and gating it would mean an
+    /// under-sized account is only fixable by a party who may no longer be around.
+    ///
+    /// **It cannot rescue an account whose SEEDS changed.** The address is re-derived with the
+    /// CURRENT recipe, so this reaches only accounts sitting at the right address with the wrong
+    /// size. That asymmetry is the entire lesson of PROPOSE-TERMINAL-2: a layout change is
+    /// recoverable if you ship this in the same change, and a seed change is recoverable by
+    /// nothing at all.
+    ///
+    /// **Zero-fill is not automatically the right default.** A field whose correct initial value is
+    /// non-zero needs an explicit backfill added here in the same change — the way `firm` had to
+    /// re-write `backstop_pool_bps` after its own resize silently turned a 5% leg into 0%.
+    pub fn migrate_challenge_layout(
+        ctx: Context<MigrateChallengeLayout>,
+        _account_size_tier: u8,
+        _phase: u8,
+        _nonce: u64,
+    ) -> Result<()> {
+        let ai = ctx.accounts.challenge.to_account_info();
+        let full = 8 + ChallengeState::INIT_SPACE;
+        let old_len = ai.data_len();
+
+        // Idempotent, and it never shrinks. An account already at (or beyond) the current layout is
+        // left byte-for-byte alone: truncating would discard the tail of an account written by a
+        // NEWER program version, which is precisely the corruption a migration must not introduce.
+        // Returning Ok rather than erroring lets a keeper sweep the whole population blindly.
+        if old_len >= full {
+            return Ok(());
+        }
+
+        // The seeds constraint already proves this is a challenge PDA of this program. The
+        // discriminator check is belt-and-braces: identifying a stored account is cheap, and
+        // resizing the wrong one is not undoable.
+        require!(old_len >= 8, ChallengeError::ChallengeAccountInvalid);
+        {
+            let data = ai.try_borrow_data()?;
+            require!(
+                data[..8] == ChallengeState::DISCRIMINATOR[..],
+                ChallengeError::ChallengeAccountInvalid
+            );
+        }
+
+        // Fund rent-exemption at the NEW size BEFORE resizing — a resize that leaves the account
+        // rent-delinquent hands it to the reaper, turning a recoverable account into a closed one.
+        let rent = Rent::get()?;
+        let needed = rent.minimum_balance(full);
+        let have = ai.lamports();
+        if needed > have {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.payer.to_account_info(),
+                        to: ai.clone(),
+                    },
+                ),
+                needed - have,
+            )?;
+        }
+
+        // The runtime caps a single instruction's data growth at `MAX_PERMITTED_DATA_INCREASE`
+        // (10,240 bytes). `ChallengeState` is ~437 bytes so this is nowhere near it today, but a
+        // future layout change that grows an account by more than 10KB at once cannot be done in one
+        // call — it would need to step the size up across several transactions.
+        ai.resize(full)?;
+
+        emit!(ChallengeLayoutMigrated {
+            challenge: ai.key(),
+            from_len: old_len as u64,
+            to_len: full as u64,
+        });
+        Ok(())
+    }
+}
+
+/// Permissionless `ChallengeState` resize (PROPOSE-TERMINAL-1/2). The rent payer is the only
+/// signer — neither the trader nor the firm authority is required, because repairing an under-sized
+/// account grants nobody anything. The `seeds` + `owner` constraints are what make that safe.
+#[derive(Accounts)]
+#[instruction(account_size_tier: u8, phase: u8, nonce: u64)]
+pub struct MigrateChallengeLayout<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: PDA seed component only — the firm this challenge belongs to. Never signs.
+    pub firm: UncheckedAccount<'info>,
+
+    /// CHECK: PDA seed component only — the challenge's trader. Never signs.
+    pub trader: UncheckedAccount<'info>,
+
+    /// CHECK: the raw challenge PDA. An account still on an older layout is SMALLER than the current
+    /// `ChallengeState`, so `Account<'info, ChallengeState>` cannot deserialize it — that undeserializable
+    /// state is exactly what this instruction exists to leave. It is therefore resized through the raw
+    /// `AccountInfo`, with the discriminator verified in-handler. `seeds` binds the address to the
+    /// (firm, trader, tier, phase, nonce) tuple and `owner = crate::ID` proves the account is ours.
+    #[account(
+        mut,
+        seeds = [
+            b"challenge",
+            firm.key().as_ref(),
+            trader.key().as_ref(),
+            &[account_size_tier],
+            &[phase],
+            &nonce.to_le_bytes(),
+        ],
+        bump,
+        owner = crate::ID,
+    )]
+    pub challenge: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Emitted on a real resize (a no-op call on an already-current account emits nothing), so a
+/// migration sweep is auditable from logs rather than by re-scanning every account's size.
+#[event]
+pub struct ChallengeLayoutMigrated {
+    pub challenge: Pubkey,
+    pub from_len: u64,
+    pub to_len: u64,
 }
 
 /// Account size tiers 0..=7 ($1k, $5k, $10k, $25k, $50k, $100k, $200k, $1M) — mirrors the
@@ -1682,6 +1837,37 @@ fn firm_risk_engine_authority(firm_ai: &AccountInfo) -> Result<Pubkey> {
     require!(data[..8] == FIRM_STATE_DISCRIMINATOR, ChallengeError::FirmAccountInvalid);
     let mut key = [0u8; 32];
     key.copy_from_slice(&data[FIRM_RISK_ENGINE_AUTHORITY_OFFSET..FIRM_RISK_ENGINE_AUTHORITY_OFFSET + 32]);
+    Ok(Pubkey::new_from_array(key))
+}
+
+/// KEEPER-API-1 — read a firm's optional provisioning authority from a `firm::FirmProvisioning` account,
+/// straight from its bytes (same reason as `firm_risk_engine_authority`: no Cargo edge to `firm`).
+///
+/// The stored `firm` is checked against the firm being purchased for. Without that, one firm's
+/// provisioning key could attest a mint on ANOTHER firm — the PDA seed is not verified here because this
+/// account arrives via `remaining_accounts`, so the binding has to come from its contents.
+fn firm_provisioning_authority(prov_ai: &AccountInfo, firm: &Pubkey) -> Result<Pubkey> {
+    require_keys_eq!(*prov_ai.owner, FIRM_PROGRAM_ID, ChallengeError::FirmAccountInvalid);
+    let data = prov_ai.try_borrow_data()?;
+    require!(
+        data.len() >= FIRM_PROVISIONING_AUTHORITY_OFFSET + 32,
+        ChallengeError::FirmAccountInvalid
+    );
+    require!(
+        data[..8] == FIRM_PROVISIONING_DISCRIMINATOR,
+        ChallengeError::FirmAccountInvalid
+    );
+    let mut bound = [0u8; 32];
+    bound.copy_from_slice(&data[8..40]);
+    require_keys_eq!(
+        Pubkey::new_from_array(bound),
+        *firm,
+        ChallengeError::FirmAccountInvalid
+    );
+    let mut key = [0u8; 32];
+    key.copy_from_slice(
+        &data[FIRM_PROVISIONING_AUTHORITY_OFFSET..FIRM_PROVISIONING_AUTHORITY_OFFSET + 32],
+    );
     Ok(Pubkey::new_from_array(key))
 }
 
@@ -3194,6 +3380,11 @@ pub enum ChallengeError {
     EmptySupplementalSegment,
     #[msg("epoch argument does not match the supplemental segment's committed epoch")]
     SupplementalEpochMismatch,
+    // ── PROPOSE-TERMINAL-3: permissionless layout migration. APPENDED, never inserted — Anchor
+    // derives error codes from variant position, so inserting above shifts every code after it and
+    // silently re-points every client that matches on a number.
+    #[msg("account is not a valid ChallengeState (discriminator mismatch)")]
+    ChallengeAccountInvalid,
 }
 
 #[cfg(test)]

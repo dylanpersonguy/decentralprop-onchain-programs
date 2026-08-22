@@ -16,7 +16,7 @@ declare_id!("DeabUFkCGWWG9CHyDAeYMj9anLmguFacvBnMidpkkxBU");
 solana_security_txt::security_txt! {
     name: "DecentralProp: Bonding Curve",
     project_url: "https://decentralprop.com",
-    contacts: "email:security@decentralprop.com",
+    contacts: "email:info@decentralprop.com",
     policy: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/blob/main/SECURITY.md",
     preferred_languages: "en",
     source_code: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/tree/main/programs/bonding_curve",
@@ -280,18 +280,43 @@ pub mod bonding_curve {
         let lp_mint_ai = ra[6].clone(); // pool_lp_mint (created by the CPI above)
         let creator_lp_ai = ra[9].clone(); // creator_lp_token = ATA(cranker, lp_mint) — where CP-Swap minted
         // Create the curve-owned LP ATA (idempotent; enforces it IS ATA(curve, lp_mint)). Cranker pays rent.
+        // ── LP-BURN (LPBURN-1) ──
+        // CP-Swap mints the pool LP to the CREATOR's ATA — here the cranker, a wallet. Left there the
+        // cranker could `withdraw` the pool and drain the migrated reserves. So, in this SAME
+        // instruction (which the cranker signed), the entire LP balance is swept to the SOL
+        // incinerator, permanently and irrecoverably.
+        //
+        // **This does not remove liquidity.** LP tokens are a CLAIM on the pool, not the pool itself.
+        // The SOL and $FIRMA stay in Raydium, tradeable forever; what is destroyed is the ability of
+        // anyone — us included — to ever take them out again.
+        //
+        // ── Why the incinerator and not `token::burn` (LPBURN-2, measured 2026-08-21) ──
+        // A real burn had to be verified rather than assumed, because the whole point of this is a
+        // signal other people's software has to read. Measured on mainnet: the incinerator holds
+        // 30,252 non-zero balances, and of the Raydium LP mints among them, ALL SIX are held at
+        // exactly 100.00% — supply intact, incinerator owning it. So the indexers' figure is
+        // `LP at burn address ÷ supply`. A `token::burn` produces no such holding: it shrinks supply
+        // and leaves whatever is left reading as one wallet owning all of the LP, which is the exact
+        // impression this is meant to remove.
+        //
+        // ── Why 100% and not a partial burn ──
+        // Every deliberate LP burn observed in the wild is 100%, and in THIS protocol a partial burn
+        // is not even a stable state: `firm::add_graduated_liquidity` mints fresh LP after
+        // graduation, so any retained share is diluted over time and the un-burned remainder grows
+        // back into the whale this removes. Burning all of it forfeits the Raydium fee stream that
+        // G-2 was meant to harvest — a stream that was never built and now never can be. That is the
+        // price of a guarantee that does not decay and does not depend on an upgrade key.
         associated_token::create_idempotent(CpiContext::new(
             ctx.accounts.associated_token_program.to_account_info(),
             associated_token::Create {
                 payer: ctx.accounts.cranker.to_account_info(),
-                associated_token: ctx.accounts.curve_lp_vault.to_account_info(),
-                authority: ctx.accounts.curve.to_account_info(), // OWNER of the vault = curve PDA
-                mint: lp_mint_ai.clone(),
+                associated_token: ctx.accounts.incinerator_lp_vault.to_account_info(),
+                authority: ctx.accounts.incinerator.to_account_info(), // OWNER = the incinerator
+                mint: lp_mint_ai,
                 system_program: ctx.accounts.system_program.to_account_info(),
                 token_program: ctx.accounts.token_program.to_account_info(),
             },
         ))?;
-        // Sweep the full minted LP (cranker authorises the transfer out of its own ATA).
         let lp_amount = {
             let data = creator_lp_ai.try_borrow_data()?;
             TokenAccount::try_deserialize(&mut &data[..])?.amount
@@ -302,14 +327,16 @@ pub mod bonding_curve {
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
                     from: creator_lp_ai,
-                    to: ctx.accounts.curve_lp_vault.to_account_info(),
+                    to: ctx.accounts.incinerator_lp_vault.to_account_info(),
                     authority: ctx.accounts.cranker.to_account_info(),
                 },
             ),
             lp_amount,
         )?;
+        emit!(LpBurned { firm, burned: lp_amount, retained: 0 });
 
-        // Mark graduated — the reserves now live in the Raydium pool, LP locked in the curve PDA.
+        // Mark graduated — the reserves now live in the Raydium pool and the LP that could withdraw
+        // them no longer belongs to anybody.
         let curve = &mut ctx.accounts.curve;
         curve.graduated = true;
         let (migrated_sol, migrated_firma) = (curve.real_sol, curve.firma_reserve);
@@ -352,6 +379,14 @@ pub const CPSWAP_INITIALIZE_DISCRIMINATOR: [u8; 8] = [175, 175, 109, 31, 13, 152
 /// wSOL reimbursed to the graduation cranker from reserves (covers the native CP-Swap fee + rent they
 /// front to the curve PDA). Fixed + generous; the cranker's small margin incentivises cranking.
 pub const GRADUATION_CRANK_REIMBURSEMENT: u64 = 500_000_000; // 0.5 SOL
+
+/// The SOL incinerator — the canonical address Solana projects burn to, and the one indexers read.
+///
+/// It holds no account of its own; tokens are sent to an ATA created UNDER it, which is why
+/// `graduate` creates that ATA rather than assuming it exists. Nobody holds a key for this address,
+/// so anything sent here is unrecoverable by construction rather than by promise.
+pub const INCINERATOR: Pubkey = pubkey!("1nc1nerator11111111111111111111111111111111");
+
 
 fn effective_sol(curve: &BondingCurve) -> u128 {
     curve.real_sol as u128 + curve.virtual_sol as u128
@@ -632,11 +667,16 @@ pub struct Graduate<'info> {
     /// CHECK: the Raydium CP-Swap program — validated as the CPI target.
     pub cpmm_program: UncheckedAccount<'info>,
 
-    /// CHECK: the curve-PDA-owned LP vault — created here as ATA(curve, lp_mint) and enforced by
-    /// `create_idempotent`; the migrated pool LP is locked into it (blocker #2). Unchecked because the
+    /// CHECK: the incinerator-owned LP vault — created here as ATA(INCINERATOR, lp_mint) and enforced
+    /// by `create_idempotent`, which fails if this is not that exact address. Untyped because the
     /// lp_mint is created during the CPI, so it cannot be typed at instruction entry.
     #[account(mut)]
-    pub curve_lp_vault: UncheckedAccount<'info>,
+    pub incinerator_lp_vault: UncheckedAccount<'info>,
+
+    /// CHECK: the burn address itself, constrained to the canonical incinerator. It only ever acts as
+    /// the ATA authority — it signs nothing and can sign nothing, which is the entire point.
+    #[account(address = INCINERATOR)]
+    pub incinerator: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -695,6 +735,19 @@ pub struct CurveGraduated {
     pub firm: Pubkey,
     pub real_sol: u64,
     pub firma_reserve: u64,
+}
+
+/// Emitted once per graduation, alongside `CurveGraduated`. Separate from it so the burn is a
+/// first-class, independently-indexable fact: "how much of this firm's LP is permanently gone" is
+/// the question a holder asks, and it should not require parsing a migration event to answer.
+#[event]
+pub struct LpBurned {
+    pub firm: Pubkey,
+    /// LP destroyed forever — the claim on this share of the pool no longer exists.
+    pub burned: u64,
+    /// LP retained by the protocol. Always 0 since LPBURN-1 — kept so the event shape can
+    /// express a partial burn if that decision is ever revisited, without a new event.
+    pub retained: u64,
 }
 
 #[error_code]

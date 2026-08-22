@@ -9,6 +9,7 @@
 #![allow(deprecated)]
 
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::{self, AssociatedToken};
 use anchor_spl::metadata::{
     create_metadata_accounts_v3,
     mpl_token_metadata::types::DataV2,
@@ -16,6 +17,7 @@ use anchor_spl::metadata::{
 };
 use anchor_spl::token::{
     self, spl_token::instruction::AuthorityType, Mint, MintTo, SetAuthority, Token, TokenAccount,
+    Transfer,
 };
 
 declare_id!("4ZmeSsuMU38jnc42P53gjY8d1N6WPc3LUibiboKwMaEj");
@@ -27,7 +29,7 @@ declare_id!("4ZmeSsuMU38jnc42P53gjY8d1N6WPc3LUibiboKwMaEj");
 solana_security_txt::security_txt! {
     name: "DecentralProp: Firm",
     project_url: "https://decentralprop.com",
-    contacts: "email:security@decentralprop.com",
+    contacts: "email:info@decentralprop.com",
     policy: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/blob/main/SECURITY.md",
     preferred_languages: "en",
     source_code: "https://github.com/dylanpersonguy/decentralprop-onchain-programs/tree/main/programs/firm",
@@ -585,18 +587,16 @@ pub mod firm {
         let min_firma_out = ctx.accounts.challenge.payout_firma_owed;
         let now = Clock::get()?.unix_timestamp;
 
-        // Daily cap: max(20% of treasury, $2k floor), resetting each UTC day (§19; OMEGA #1).
+        // PAYOUT-CAP-REMOVE-1: the 20%-of-treasury daily cap is GONE (DEC-101). `daily_payout_spent`
+        // and `payout_day` are still maintained — they are now pure telemetry (the admin liquidity
+        // surface and the ARE read them), not a gate. The day-rollover reset is kept so the counter
+        // keeps meaning "spent today" rather than drifting into a lifetime total.
         let firm = &mut ctx.accounts.firm_state;
         let day = now / 86_400;
         if day != firm.payout_day {
             firm.daily_payout_spent = 0;
             firm.payout_day = day;
         }
-        let daily_cap = (firm.treasury_sol / 5).max(MIN_DAILY_PAYOUT_FLOOR_SOL);
-        require!(
-            firm.daily_payout_spent.saturating_add(sol_amount) <= daily_cap,
-            FirmError::DailyPayoutCapExceeded
-        );
         require!(sol_amount <= firm.treasury_sol, FirmError::InsufficientTreasury);
 
         // L-3: record the $FIRMA ACTUALLY delivered (the curve may return more than the owed floor
@@ -918,18 +918,20 @@ pub mod firm {
             FirmError::PayoutAlreadyFilled
         );
 
-        // Daily cap: max(20% of treasury, $2k floor), resetting each UTC day (§19; OMEGA #1).
+        // PAYOUT-CAP-REMOVE-1 (DEC-101): the 20%-of-treasury daily cap is GONE. It was never a
+        // solvency invariant — `sol_amount <= treasury_sol` below is — and as a rate limiter it was
+        // actively harmful: `daily_cap` was recomputed on EVERY call against the treasury the buy
+        // itself had just shrunk, so starting a day at treasury T the gate shut once cumulative spend
+        // passed T/6, not the intended T/5. Tier-1 therefore stopped ~16.7% in and every remaining
+        // payout that day escalated to the Tier-2 reserve, spending the backstop while the treasury
+        // sat healthy (devnet: 20 of Trustless Funding's 40 payouts, $141k of $204k, 18/18 days
+        // predicted by the T/6 rule). `daily_payout_spent`/`payout_day` are retained as telemetry.
         let firm = &mut ctx.accounts.firm_state;
         let day = now / 86_400;
         if day != firm.payout_day {
             firm.daily_payout_spent = 0;
             firm.payout_day = day;
         }
-        let daily_cap = (firm.treasury_sol / 5).max(MIN_DAILY_PAYOUT_FLOOR_SOL);
-        require!(
-            firm.daily_payout_spent.saturating_add(sol_amount) <= daily_cap,
-            FirmError::DailyPayoutCapExceeded
-        );
         require!(sol_amount <= firm.treasury_sol, FirmError::InsufficientTreasury);
 
         // Load payout-split config and settlement tier before the buy so the universal
@@ -1028,9 +1030,21 @@ pub mod firm {
         qp.firma_amount_delivered = qp.firma_amount_delivered.saturating_add(trader_deliver);
         let fully_filled = qp.firma_amount_delivered >= qp.firma_amount_owed;
 
-        // Circuit breaker: an outstanding payout after this fill means the treasury
-        // could not satisfy it — trip velocity break and escalate one tier immediately.
-        if !fully_filled {
+        // Circuit breaker. PAYOUT-CAP-REMOVE-2 (bug-031): this used to trip on ANY partial fill, on
+        // the stated reasoning that "an outstanding payout after this fill means the treasury could
+        // not satisfy it". That was false, and provably so: the daily cap truncated fills routinely
+        // on firms with a full treasury, so the breaker fired on solvent firms and — because nothing
+        // in production ever cleared it — latched there. Trustless Funding sat `velocity_break_flag
+        // = true` with 355.84 SOL and `open_payouts = 0`, which froze backstop-staker withdrawals
+        // (§19.1) and left Tier-3/4 armed against investor capital on a firm that owed nothing.
+        //
+        // A partial fill has never implied insolvency on its own. With the cap gone the remaining
+        // truncation causes are (a) the treasury genuinely ran out, and (b) the keeper's target was
+        // clamped just under the curve's `firma_reserve`, or lost to split/curve rounding — (b) is
+        // an ordinary short fill on a firm with money. Only (a) is a solvency event, and the only
+        // honest on-chain evidence for it is that this fill consumed essentially the whole treasury.
+        let treasury_exhausted = firm.treasury_sol <= INSOLVENCY_RESIDUAL_DUST_SOL;
+        if !fully_filled && treasury_exhausted {
             firm.velocity_break_flag = true;
             let current = firm.risk_tier as u8;
             if current < RiskTier::Warning as u8 {
@@ -1038,11 +1052,24 @@ pub mod firm {
                 firm.last_tier_change_at = now;
                 emit!(RiskTierUpdated { firm: firm.key(), tier: firm.risk_tier, changed_at: now });
             }
-        } else {
+        }
+        if fully_filled {
             // Obligation discharged: the entry can only reach `firma_amount_delivered >=
             // firma_amount_owed` once (the ix requires it be outstanding at entry), so this
             // fires exactly on the single fully-filled transition. Clears the F1 close gate.
             firm.open_payouts = firm.open_payouts.saturating_sub(1);
+
+            // ...and give the breaker a way DOWN. `set_velocity_break` exists but has never had a
+            // production caller (the ARE only `logger.warn`s its own off-chain signal), so the flag
+            // was write-only — set by this handler, cleared by nothing, permanent by construction.
+            // A payout discharged IN FULL out of the firm's own treasury is the most direct
+            // solvency evidence this program can observe, and it is the exact inverse of the
+            // condition that trips the flag, so it is what clears it. Deliberately symmetric: no
+            // new authority, no keeper, nothing to forget to run. This also releases the §19.1
+            // backstop-withdrawal freeze, which is correct — a firm paying in full is not in the
+            // shortfall that freeze exists for. The RISK TIER is intentionally NOT relaxed here:
+            // tier relaxation belongs to the ARE and its timelocks, not to a single payout.
+            firm.velocity_break_flag = false;
         }
 
         emit!(QueuedPayoutFilled {
@@ -1168,18 +1195,19 @@ pub mod firm {
             );
         }
 
-        // Daily cap + treasury balance — identical gate to `process_queued_payout`.
+        // Treasury balance — identical gate to `process_queued_payout`. PAYOUT-CAP-REMOVE-1 (DEC-101)
+        // removed the shared 20% `daily_payout_spent` cap that used to sit here too. The two
+        // advance-ONLY caps above (`ADVANCE_CAP_BPS` outstanding-float, `ADVANCE_DAILY_CAP_BPS`
+        // daily velocity) are deliberately KEPT: they bound advancing against a still-Provisional
+        // settlement, which is a different and strictly riskier exposure than paying out a Final one
+        // — there is no clawback on this path, and SETTLE-SOL-PRICE-1 means a fault proof can never
+        // validate the struck amount. Removing the general payout cap says nothing about that risk.
         let firm = &mut ctx.accounts.firm_state;
         let day = now / 86_400;
         if day != firm.payout_day {
             firm.daily_payout_spent = 0;
             firm.payout_day = day;
         }
-        let daily_cap = (firm.treasury_sol / 5).max(MIN_DAILY_PAYOUT_FLOOR_SOL);
-        require!(
-            firm.daily_payout_spent.saturating_add(sol_amount) <= daily_cap,
-            FirmError::DailyPayoutCapExceeded
-        );
         require!(sol_amount <= firm.treasury_sol, FirmError::InsufficientTreasury);
 
         let cfg = firm.stakeholder_config;
@@ -1713,6 +1741,54 @@ pub mod firm {
         emit!(LossBackMinStakeSet {
             firm: ctx.accounts.firm_state.key(),
             min_stake: LOSS_BACK_MIN_STAKE,
+        });
+        Ok(())
+    }
+
+    /// KEEPER-API-1 — designate a SECOND key that may attest a challenge mint for this firm.
+    ///
+    /// The web-facing gateway must co-sign every `purchase_challenge`, because the challenge program
+    /// requires the firm's authority to attest the rules being frozen into the challenge. Today the only
+    /// key that can do that is `risk_engine_authority` — which is also the ONLY key permitted to
+    /// `propose_settlement`, i.e. to claim what a trader's outcome was. So the process serving public
+    /// HTTP has to hold the key that decides who won, and a leak of it is a licence to fabricate
+    /// winners (bounded only by the fraud-proof window).
+    ///
+    /// A provisioning authority separates those two powers. The challenge program accepts EITHER key as
+    /// the mint attestation, but ALWAYS freezes `risk_engine_authority` into
+    /// `challenge.settlement_authority` — so a provisioning key can mint an evaluation and can never
+    /// claim its result, propose its settlement, or move its money.
+    ///
+    /// Deliberately a SEPARATE PDA rather than a field appended to `FirmState`. That struct's
+    /// `migrate_firm_permissionless` backfills `backstop_pool_bps` at `full - 2`, so appending 32 bytes
+    /// would write the backstop default into the tail of the new field AND leave the real
+    /// `backstop_pool_bps` zeroed — silently deleting the 5% backstop leg on every firm that migrated.
+    /// A separate account also makes this opt-in: a firm with no `FirmProvisioning` behaves exactly as
+    /// it does today, so nothing needs migrating at all.
+    pub fn set_firm_provisioning_authority(
+        ctx: Context<SetFirmProvisioningAuthority>,
+        provisioning_authority: Pubkey,
+    ) -> Result<()> {
+        require_keys_neq!(
+            provisioning_authority,
+            Pubkey::default(),
+            FirmError::Unauthorized
+        );
+        // Setting it to the settlement key would hand back exactly the power this separation removes.
+        require_keys_neq!(
+            provisioning_authority,
+            ctx.accounts.firm_state.risk_engine_authority,
+            FirmError::Unauthorized
+        );
+        let bump = ctx.bumps.firm_provisioning;
+        let firm = ctx.accounts.firm_state.key();
+        let p = &mut ctx.accounts.firm_provisioning;
+        p.firm = firm;
+        p.provisioning_authority = provisioning_authority;
+        p.bump = bump;
+        emit!(FirmProvisioningAuthoritySet {
+            firm,
+            provisioning_authority,
         });
         Ok(())
     }
@@ -2843,6 +2919,103 @@ pub mod firm {
     /// the SOL treasury can't fund a curve buy, the keeper draws the firm's pre-acquired
     /// `$FIRMA` (seeded at deployment) straight to the trader — no curve sale, no slippage —
     /// before touching the investor backstop. Signed by the challenge's settlement authority.
+    /// Pull vested Tier-2 reserve out of its Streamflow vest and into the firm's payout vault
+    /// (RESERVE-VEST-1). Permissionless.
+    ///
+    /// ── Why the reserve is in a vest at all ──
+    /// 20% of every firm's supply sat in a firm PDA, which on DexScreener is indistinguishable from
+    /// insiders holding a third of the float — measured on devnet, two protocol addresses held 30%
+    /// against ~14% for the actual public. Labeling cannot fix that: it is per-firm, so it is O(number
+    /// of firms) forever, and DexScreener has no holder-label mechanism at all. A Streamflow vest is
+    /// recognised automatically by every index, on every firm, with no outreach — so 4% stays liquid
+    /// and 16% arrives over six months, reading as locked from the day the pool opens.
+    ///
+    /// ── Why the recipient is a PDA and not the firm owner ──
+    /// Streamflow's `withdraw` requires a signature from an authority that EQUALS the recipient
+    /// (`withdraw_authority.is_signer` && `withdraw_authority.key == recipient.key`). Naming the firm
+    /// PDA as recipient means this program is the only thing in existence that can produce that
+    /// signature, so the vest cannot be drained around us — there is no other door. Streamflow holds
+    /// the safe; we keep the key.
+    ///
+    /// Permissionless because the tokens can only ever land in the firm's own payout vault: a cranker
+    /// gains nothing by calling it and the firm loses nothing, so gating it would only create a way
+    /// for the reserve to go unclaimed while a trader waits.
+    pub fn release_vested_reserve(ctx: Context<ReleaseVestedReserve>, amount: u64) -> Result<()> {
+        require!(amount > 0, FirmError::ZeroAmount);
+        let bump = [ctx.accounts.firm_state.bump];
+        let seeds = firm_signer(&ctx.accounts.firm_state.owner, &bump);
+
+        // Streamflow `withdraw` — discriminator + amount:u64. Hand-encoded rather than via a crate:
+        // adding their program as a Cargo dependency to pull one 8-byte constant would put a
+        // third-party build in the path of every `firm` compile, and this program is already the
+        // 2 MB one whose deploys are fragile.
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&STREAMFLOW_WITHDRAW_DISCRIMINATOR);
+        data.extend_from_slice(&amount.to_le_bytes());
+
+        // Account order is the deployed program's, read from its on-chain IDL rather than from docs.
+        let metas = vec![
+            AccountMeta::new_readonly(ctx.accounts.firm_state.key(), true), // authority == recipient
+            AccountMeta::new(ctx.accounts.firm_state.key(), false),         // recipient
+            AccountMeta::new(ctx.accounts.recipient_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.stream_metadata.key(), false),
+            AccountMeta::new(ctx.accounts.escrow_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.streamflow_treasury.key(), false),
+            AccountMeta::new(ctx.accounts.streamflow_treasury_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.partner.key(), false),
+            AccountMeta::new(ctx.accounts.partner_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.firma_mint.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        let ix = anchor_lang::solana_program::instruction::Instruction {
+            program_id: ctx.accounts.streamflow_program.key(),
+            accounts: metas,
+            data,
+        };
+        anchor_lang::solana_program::program::invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.firm_state.to_account_info(),
+                ctx.accounts.recipient_tokens.to_account_info(),
+                ctx.accounts.stream_metadata.to_account_info(),
+                ctx.accounts.escrow_tokens.to_account_info(),
+                ctx.accounts.streamflow_treasury.to_account_info(),
+                ctx.accounts.streamflow_treasury_tokens.to_account_info(),
+                ctx.accounts.partner.to_account_info(),
+                ctx.accounts.partner_tokens.to_account_info(),
+                ctx.accounts.firma_mint.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.streamflow_program.to_account_info(),
+            ],
+            &[&seeds],
+        )?;
+
+        // Streamflow pays into the recipient's ATA; the payout path reads `treasury_firma_vault`.
+        // Sweep it across in the same instruction so the reserve is never split across two accounts
+        // and `draw_treasury_firma` needs no knowledge that a vest exists at all.
+        ctx.accounts.recipient_tokens.reload()?;
+        let landed = ctx.accounts.recipient_tokens.amount;
+        if landed > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.recipient_tokens.to_account_info(),
+                        to: ctx.accounts.treasury_firma_vault.to_account_info(),
+                        authority: ctx.accounts.firm_state.to_account_info(),
+                    },
+                    &[&seeds],
+                ),
+                landed,
+            )?;
+        }
+        emit!(VestedReserveReleased {
+            firm: ctx.accounts.firm_state.key(),
+            amount: landed,
+        });
+        Ok(())
+    }
+
     pub fn draw_treasury_firma(ctx: Context<DrawTreasuryFirma>, firma_amount: u64) -> Result<()> {
         require_payout_delivery_authority(
             &ctx.accounts.challenge,
@@ -3224,6 +3397,46 @@ pub mod firm {
             max_sol_deposit,
             max_firma_deposit,
         )?;
+
+        // ── LP-BURN (LPBURN-1) ──
+        // Sweep the LP this deposit just minted to the incinerator, exactly as `graduate` does.
+        //
+        // Burning at graduation alone is not enough, and that is the whole reason this block exists:
+        // this crank mints FRESH LP on every run, so a graduation burn of 100% decays as soon as the
+        // first deposit lands — the burned share is `incinerator ÷ supply`, and this instruction
+        // grows the denominator. Left un-burned, the protocol's LP position rebuilds itself into the
+        // unlocked-looking holding the burn was meant to remove, just more slowly.
+        //
+        // Economically this changes nothing: `lp_locked_vault` already had no withdraw instruction,
+        // so the liquidity was never coming back. What it changes is that the guarantee no longer
+        // depends on this program's upgrade key, and that indexers can finally see it.
+        ctx.accounts.lp_locked_vault.reload()?;
+        let minted_lp = ctx.accounts.lp_locked_vault.amount;
+        if minted_lp > 0 {
+            associated_token::create_idempotent(CpiContext::new(
+                ctx.accounts.associated_token_program.to_account_info(),
+                associated_token::Create {
+                    payer: ctx.accounts.cranker.to_account_info(),
+                    associated_token: ctx.accounts.incinerator_lp_vault.to_account_info(),
+                    authority: ctx.accounts.incinerator.to_account_info(),
+                    mint: ctx.accounts.lp_mint.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    token_program: ctx.accounts.token_program.to_account_info(),
+                },
+            ))?;
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.lp_locked_vault.to_account_info(),
+                        to: ctx.accounts.incinerator_lp_vault.to_account_info(),
+                        authority: ctx.accounts.firm_state.to_account_info(),
+                    },
+                    &[&seeds],
+                ),
+                minted_lp,
+            )?;
+        }
 
         // Draw the earmark down by the SOL actually consumed (swap + deposit) and re-sync the cache.
         ctx.accounts.treasury_vault.reload()?;
@@ -3667,6 +3880,61 @@ pub mod firm {
     /// Record/clear the velocity-break flag (§9 velocity breaker).
     pub fn set_velocity_break(ctx: Context<UpdateRiskTier>, active: bool) -> Result<()> {
         ctx.accounts.firm_state.velocity_break_flag = active;
+        Ok(())
+    }
+
+    /// Permissionless release of a LATCHED velocity break (§9 — bug-031, third defect).
+    ///
+    /// `process_queued_payout` now clears the flag when a payout is discharged in full, which is the
+    /// exact inverse of the condition that sets it. That fixes the common case and nothing else: it
+    /// only ever fires if the firm HAS a next payout. A firm that trips the breaker and then goes
+    /// quiet sits at `open_payouts == 0` forever, never reaches another fill, and stays latched
+    /// permanently — so the auto-clear leaves the latch fully intact for precisely the firms with no
+    /// activity to argue their way out with. Trustless Funding is the worked example: frozen while
+    /// holding 355.84 SOL against nothing owed, with no outstanding obligation and therefore no
+    /// mechanism that could ever release it.
+    ///
+    /// `set_velocity_break` does not cover this gap either. It requires the firm's
+    /// `risk_engine_authority` to sign, and the original finding was that nothing in production ever
+    /// calls it — a permission nobody exercises is not a release path.
+    ///
+    /// So this is permissionless, and its evidence is read live off the chain rather than taken on
+    /// any caller's word:
+    ///   1. the firm owes nothing — `open_payouts == 0`; and
+    ///   2. its treasury vault genuinely holds more than insolvency dust, read from the token
+    ///      account itself, not from the `treasury_sol` cache (which a stale mirror could understate).
+    ///
+    /// A firm with no outstanding obligation and a funded treasury is definitionally not in the
+    /// shortfall the §19.1 backstop freeze exists for. There is no input to lie about — both facts
+    /// are chain state — which is what makes opening this to any caller safe. That matters: the
+    /// people this latch hurts most are backstop stakers who cannot withdraw, and they can now lift
+    /// it themselves instead of waiting on an authority that has never acted.
+    ///
+    /// Deliberately narrow in two ways. It REFUSES while any payout is outstanding: proving the
+    /// treasury covers those obligations would mean summing every `QueuedPayout`, and this program
+    /// stores only a count, so a caller could otherwise clear the breaker on a firm that really is
+    /// short. And it does NOT touch `risk_tier` — tier relaxation belongs to the ARE and its
+    /// relaxation timelock, the same line the auto-clear draws.
+    pub fn clear_velocity_break_permissionless(
+        ctx: Context<ClearVelocityBreakPermissionless>,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let treasury_balance = ctx.accounts.treasury_vault.amount;
+        let firm = &mut ctx.accounts.firm_state;
+
+        require!(firm.velocity_break_flag, FirmError::VelocityBreakNotActive);
+        require!(firm.open_payouts == 0, FirmError::VelocityBreakPayoutsOutstanding);
+        require!(
+            treasury_balance > INSOLVENCY_RESIDUAL_DUST_SOL,
+            FirmError::VelocityBreakTreasuryUnproven
+        );
+
+        firm.velocity_break_flag = false;
+        emit!(VelocityBreakCleared {
+            firm: firm.key(),
+            treasury_sol: treasury_balance,
+            cleared_at: now,
+        });
         Ok(())
     }
 
@@ -4569,6 +4837,28 @@ pub mod firm {
 pub const RELAX_TIMELOCK_STANDARD: i64 = 86_400;
 pub const RELAX_TIMELOCK_CRITICAL: i64 = 172_800;
 /// $FIRMA decimals.
+/// The SOL incinerator — where this protocol's LP goes at graduation and on every post-graduation
+/// liquidity add (LPBURN-1). No key exists for it, so what lands here is unrecoverable by
+/// construction. It is also the address indexers read to compute "burned %", which is why LP is
+/// TRANSFERRED here rather than `token::burn`ed — see MASTER_FIXES LPBURN-2 for the measurement.
+pub const INCINERATOR: Pubkey = pubkey!("1nc1nerator11111111111111111111111111111111");
+
+/// Streamflow's `withdraw` discriminator, read from the DEPLOYED program's on-chain IDL
+/// (`anchor idl fetch HqDGZjaVRXJ9MGRQEw7qDc2rAr6iH1n1kAQdCZaCMfMZ`), not from their docs or a
+/// published crate — the deployed bytecode is the only authority on what it will accept.
+/// Streamflow's timelock program.
+///
+/// **Cluster-dependent**, unlike every DecentralProp program ID (ours are identical across clusters;
+/// theirs are not). Devnet `HqDGZja…`, mainnet `strmRqUC…` — both verified executable on-chain
+/// 2026-08-21. Selected by the same `devnet-fast` style feature split the challenge program uses, so
+/// a mainnet build can never accidentally carry the devnet address.
+#[cfg(feature = "streamflow-devnet")]
+pub const STREAMFLOW_PROGRAM_ID: Pubkey = pubkey!("HqDGZjaVRXJ9MGRQEw7qDc2rAr6iH1n1kAQdCZaCMfMZ");
+#[cfg(not(feature = "streamflow-devnet"))]
+pub const STREAMFLOW_PROGRAM_ID: Pubkey = pubkey!("strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m");
+
+pub const STREAMFLOW_WITHDRAW_DISCRIMINATOR: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
+
 pub const FIRMA_DECIMALS: u8 = 6;
 /// Highest deployment tier index (0 Starter … 4 Enterprise).
 pub const MAX_TIER: u8 = 4;
@@ -4666,16 +4956,25 @@ pub const POST_TOKEN_TRAILING_LEN: usize = AUTHORITY_ROTATION_FIELDS_LEN
 /// longer than a settlement's fraud-proof window, so any challenge outstanding at rotation drains under
 /// the old key before it dies.
 pub const AUTHORITY_ROTATION_GRACE: i64 = 14 * 86_400;
-/// Absolute floor for the daily payout cap, in **lamports** (wSOL, 9 dp) — 15 SOL. OMEGA finding #1:
-/// the flat 20%-of-treasury daily cap spirals when a firm's treasury runs thin under a realistic
-/// funded payout load (payouts thin the treasury → smaller cap → more queue → treasury stays thin).
-/// The floor lets a thin-but-solvent firm still clear a baseline daily volume; the per-payout
-/// `amount ≤ treasury` and concentration guards remain, so solvency is unaffected.
-/// SOL MIGRATION: the unit is now **lamports** (wSOL, 9 dp) — dimensionally a SOL amount compared
-/// against the lamport treasury balance (oracle-free, `SOL_SETTLEMENT_MIGRATION.md` Phase 3+4). The
-/// raw value is kept (2e9 = 2 SOL) as a **placeholder**; its real SOL-native magnitude is a Phase-6
-/// (ARE solvency) decision, since a SOL-denominated USD-pegged floor is exactly the §B open question.
+/// RETIRED by PAYOUT-CAP-REMOVE-1 (DEC-101) — the daily payout cap it floored no longer exists, so
+/// this no longer gates anything. Its own doc comment described the defect that killed the cap:
+/// *"the flat 20%-of-treasury daily cap spirals when a firm's treasury runs thin (payouts thin the
+/// treasury → smaller cap → more queue → treasury stays thin)"* — OMEGA finding #1. A floor only
+/// blunted that spiral at the thin end; it could not fix it, because the cap was recomputed against
+/// the treasury each buy had just reduced, so it shut at T/6 rather than the intended T/5 at EVERY
+/// treasury size. Kept as a named constant purely so `MIN_DAILY_ADVANCE_FLOOR_SOL` below still has
+/// the baseline its comparison test is written against; nothing reads it as a gate.
 pub const MIN_DAILY_PAYOUT_FLOOR_SOL: u64 = 2_000_000_000;
+/// PAYOUT-CAP-REMOVE-2 (bug-031) — the treasury residual, in **lamports** (wSOL, 9 dp), at or below
+/// which a partially-filled payout counts as genuine INSOLVENCY rather than an ordinary short fill.
+///
+/// Why a dust band and not `== 0`: the delivery keeper sizes an under-funded fill at the whole
+/// treasury, but the curve returns part of the spend to the treasury as firm fees inside the same
+/// CPI (see the `treasury_vault.reload()` right above the breaker), so a drained treasury lands a
+/// few lamports ABOVE zero, never exactly on it. An `== 0` test would therefore never fire and the
+/// breaker would be dead in the one case it exists for. 0.01 SOL is far below any real fill and far
+/// above that fee residual.
+pub const INSOLVENCY_RESIDUAL_DUST_SOL: u64 = 10_000_000;
 /// Loyalty fast-track queue priority marker.
 pub const PRIORITY_STANDARD: u8 = 0;
 pub const PRIORITY_FAST_TRACK: u8 = 1;
@@ -5175,14 +5474,15 @@ pub struct DeploymentFeeSplit {
 /// MUST mirror the TS `DEPLOYMENT_TIER_USD` (packages/solana-client/src/deployment-fee.ts) — the ladder
 /// the gateway actually charges from. Tiers 0/1 were previously 5k/10k here vs 1k/5k in TS (audit F-4,
 /// fee-math-precision-audit): firms deploy at the TS prices, so this reference is aligned to them.
-/// Starter $1k · Growth $5k · Pro $25k · Scale $50k · Enterprise $100k.
+/// Retuned 2026-08-12 (TIER-PRICE-1): the top three rungs came down 25k/50k/100k → 10k/25k/50k.
+/// Starter $1k · Growth $5k · Pro $10k · Scale $25k · Enterprise $50k.
 pub fn deployment_tier_price_usd(tier: u8) -> u64 {
     let usd: u64 = match tier {
         0 => 1_000,
         1 => 5_000,
-        2 => 25_000,
-        3 => 50_000,
-        _ => 100_000,
+        2 => 10_000,
+        3 => 25_000,
+        _ => 50_000,
     };
     usd * 1_000_000
 }
@@ -5223,14 +5523,33 @@ pub fn compute_deployment_fee_split(
 
 // ── Graduation / Raydium migration fee (§20.x) ──────────────────────────────────
 // Skimmed from the curve's real SOL at graduation, *before* the remainder seeds the Raydium pool.
-// A modest one-time milestone toll — the protocol already earns 0.5%/trade on the way up, so this
-// stays small enough not to thin the new pool's depth. Routed: 1.0% → DecentralProp protocol revenue,
-// 0.5% → $DPROP buy-and-burn (milestone deflation, mirrors the deploy-fee $DPROP burn). The wiring of
-// the actual Raydium migration (pool create + LP lock) is the deferred Phase-4.4 work; this is the
-// economic spec it will use.
-pub const MIGRATION_FEE_BPS: u16 = 150; // 1.5% of graduated liquidity (= DP + $DPROP burn legs)
-pub const MIGRATION_FEE_DP_BPS: u16 = 100; // 1.0% → DecentralProp
-pub const MIGRATION_FEE_DPROP_BURN_BPS: u16 = 50; // 0.5% → $DPROP buy-and-burn
+// Routed: 2.5% → DecentralProp protocol revenue, 1.0% → $DPROP buy-and-burn (milestone deflation,
+// mirrors the deploy-fee $DPROP burn). The wiring of the actual Raydium migration (pool create +
+// LP lock) is the deferred Phase-4.4 work; this is the economic spec it will use.
+//
+// ── Raised 1.5% → 3.5% (2026-08-20, owner decision) ──
+// The original rate was set as "a modest one-time toll, because the protocol already earns
+// 0.5%/trade on the way up". That premise is the part that stopped being true. `bonding_curve::buy`
+// and `sell` both revert on `!graduated`, so the per-trade leg does not shrink at graduation — it
+// ENDS, permanently, and the LP position that replaces it accrues fees the protocol cannot
+// currently harvest (G-2, open). The toll is not a supplement to a continuing revenue stream; it is
+// the last payment that stream ever makes.
+//
+// 3.5% was also chosen because of WHERE it sits. A per-trade fee is quoted to every trader on every
+// swap and compared against pump.fun's 1% by anyone who cares to look; a one-time migration toll is
+// paid once, by a firm crossing a milestone it wanted to cross, and is quoted to nobody. Raising the
+// number nobody comparison-shops is strictly cheaper than raising the number everybody does.
+//
+// Cost of the raise: it thins the new pool by 2% of graduated liquidity (~1.7 SOL on an 83-SOL
+// graduation), which is real — a shallower pool means worse execution for the traders the migration
+// exists to serve. That is the trade being made, deliberately, not an oversight.
+//
+// The DP:burn ratio moves 2:1 → 2.5:1. The burn leg still DOUBLES in absolute terms (0.5% → 1.0%);
+// the split lands on round numbers rather than preserving the old ratio exactly, because these are
+// published figures and 2.5/1.0 is a pair a reader can hold in their head.
+pub const MIGRATION_FEE_BPS: u16 = 350; // 3.5% of graduated liquidity (= DP + $DPROP burn legs)
+pub const MIGRATION_FEE_DP_BPS: u16 = 250; // 2.5% → DecentralProp
+pub const MIGRATION_FEE_DPROP_BURN_BPS: u16 = 100; // 1.0% → $DPROP buy-and-burn
 
 /// The destinations the graduation migration fee splits into. `to_pool` is the residual liquidity
 /// that seeds the Raydium pool after the fee is skimmed.
@@ -6635,10 +6954,27 @@ pub struct AddGraduatedLiquidity<'info> {
     #[account(mut, token::mint = firm_state.firma_mint, token::authority = firm_state)]
     pub lp_firma_staging: Box<Account<'info, TokenAccount>>,
 
-    /// The permanently-locked LP position: CP-Swap mints the pool LP here. Firm-PDA-owned and the firm
-    /// program exposes NO instruction that moves LP out of it — "lock-not-burn", identical to graduation.
+    /// Transient LP holding: CP-Swap mints the pool LP here and the same instruction sweeps it to the
+    /// incinerator (LPBURN-1), so it is empty at rest. Formerly the permanent "lock-not-burn" position;
+    /// the name is kept so the deposit CPI's account order is unchanged.
     #[account(mut, token::authority = firm_state)]
     pub lp_locked_vault: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: the incinerator-owned LP vault — created here as ATA(INCINERATOR, lp_mint) and enforced
+    /// by `create_idempotent`, which fails if this is not that exact address.
+    #[account(mut)]
+    pub incinerator_lp_vault: UncheckedAccount<'info>,
+
+    /// CHECK: the burn address, pinned. It is only ever an ATA authority; it signs nothing, ever.
+    #[account(address = INCINERATOR)]
+    pub incinerator: UncheckedAccount<'info>,
+
+    /// The pool's LP mint — needed to derive/create the incinerator ATA.
+    pub lp_mint: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
     // remaining_accounts: [cpmm, ..13 swap_base_input][cpmm, ..13 deposit] — validated in the CPI helpers.
 }
 
@@ -9853,6 +10189,61 @@ impl<'info> SweepCurveFeesToPool<'info> {
 
 // Accounts are Box'd to keep the BPF stack frame under 4 KB.
 #[derive(Accounts)]
+pub struct ReleaseVestedReserve<'info> {
+    /// Permissionless cranker — pays gas only. The tokens can land nowhere but the firm's own vault.
+    pub cranker: Signer<'info>,
+
+    /// Also the Streamflow stream's RECIPIENT and its withdraw authority. Streamflow requires those
+    /// two to be the same key, which is what makes this program the only possible withdrawer.
+    #[account(mut, seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    /// The firm's Tier-2 payout reserve — where released tokens end up.
+    #[account(
+        mut,
+        seeds = [b"treasury_firma_vault", firm_state.key().as_ref()],
+        bump,
+    )]
+    pub treasury_firma_vault: Box<Account<'info, TokenAccount>>,
+
+    /// ATA(firm_state, firma_mint) — Streamflow pays the recipient's ATA, so this is a transient hop
+    /// that is swept into the vault in the same instruction and is empty at rest.
+    #[account(mut, token::mint = firma_mint, token::authority = firm_state)]
+    pub recipient_tokens: Box<Account<'info, TokenAccount>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    /// CHECK: the stream's metadata account. Validated by Streamflow itself, which checks it belongs
+    /// to this recipient — a forged one fails inside the CPI rather than silently paying elsewhere.
+    #[account(mut)]
+    pub stream_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: the stream's escrow, validated by Streamflow against `stream_metadata`.
+    #[account(mut)]
+    pub escrow_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's own fee accounts. Pinned by their program, not by us.
+    #[account(mut)]
+    pub streamflow_treasury: UncheckedAccount<'info>,
+    /// CHECK: see above.
+    #[account(mut)]
+    pub streamflow_treasury_tokens: UncheckedAccount<'info>,
+    /// CHECK: see above.
+    #[account(mut)]
+    pub partner: UncheckedAccount<'info>,
+    /// CHECK: see above.
+    #[account(mut)]
+    pub partner_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: the Streamflow program, pinned to the address for this cluster.
+    #[account(address = STREAMFLOW_PROGRAM_ID)]
+    pub streamflow_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct DrawTreasuryFirma<'info> {
     pub authority: Signer<'info>,
 
@@ -10469,6 +10860,21 @@ pub struct UpdateRiskTier<'info> {
     pub firm_state: Account<'info, FirmState>,
 }
 
+/// Accounts for `clear_velocity_break_permissionless`. No `Signer` at all — deliberately: every
+/// precondition is chain state the caller cannot influence, so requiring a signature would only
+/// decide WHO may state a fact the program verifies for itself. The treasury vault is pinned by
+/// `address = firm_state.treasury_vault` so a caller cannot substitute a funded account belonging
+/// to some other firm as false evidence of solvency.
+#[derive(Accounts)]
+pub struct ClearVelocityBreakPermissionless<'info> {
+    #[account(mut, seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Account<'info, FirmState>,
+
+    /// Read-only: this instruction proves solvency from the vault, it never moves anything out of it.
+    #[account(address = firm_state.treasury_vault)]
+    pub treasury_vault: Box<Account<'info, TokenAccount>>,
+}
+
 #[derive(Accounts)]
 pub struct UpdateStakeholderConfig<'info> {
     pub owner: Signer<'info>,
@@ -10508,6 +10914,34 @@ pub struct SetLossBackMinStake<'info> {
         constraint = firm_state.owner == owner.key() @ FirmError::Unauthorized,
     )]
     pub firm_state: Box<Account<'info, FirmState>>,
+}
+
+/// KEEPER-API-1 — accounts for `set_firm_provisioning_authority`. Owner-signed: naming a key that may
+/// mint evaluations for this firm is a firm-level decision and the owner is the only party with
+/// standing to make it. `init_if_needed` so one instruction both creates and re-points it — rotating a
+/// leaked provisioning key is the same action as setting the first one.
+#[derive(Accounts)]
+pub struct SetFirmProvisioningAuthority<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        seeds = [b"firm", firm_state.owner.as_ref()],
+        bump = firm_state.bump,
+        constraint = firm_state.owner == owner.key() @ FirmError::Unauthorized,
+    )]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + FirmProvisioning::INIT_SPACE,
+        seeds = [b"firm_provisioning", firm_state.key().as_ref()],
+        bump,
+    )]
+    pub firm_provisioning: Box<Account<'info, FirmProvisioning>>,
+
+    pub system_program: Program<'info, System>,
 }
 
 /// K-1 — accounts for `set_guardian`. The CURRENT guardian signs (self-rotation of the platform
@@ -10631,6 +11065,28 @@ impl<'info> ClaimDrip<'info> {
 }
 
 /// Per-firm state PDA (architecture §19). Seeds: ["firm", owner].
+/// KEEPER-API-1 — a firm's optional SECOND mint-attestation key.
+///
+/// Exists so the process serving public HTTP does not have to hold `risk_engine_authority`, which is
+/// the only key allowed to `propose_settlement` (claim a trader's outcome). See
+/// `set_firm_provisioning_authority` for the full reasoning, including why this is a separate account
+/// rather than a field appended to `FirmState`.
+///
+/// Read cross-program by the challenge program straight from these bytes (it cannot depend on this
+/// crate — `firm` already depends on `challenge` via CPI). `firm` is stored, not merely implied by the
+/// PDA seed, so that raw-bytes reader can verify the account it was handed belongs to the firm it
+/// thinks it does. **Field order here is load-bearing**: `challenge` pins the byte offset of
+/// `provisioning_authority`, and `onchain-account-compat.test.ts` fails if this layout moves.
+#[account]
+#[derive(InitSpace)]
+pub struct FirmProvisioning {
+    /// The `FirmState` this authorizes for.
+    pub firm: Pubkey,
+    /// May co-sign `purchase_challenge` for this firm. Never able to settle, propose, or move funds.
+    pub provisioning_authority: Pubkey,
+    pub bump: u8,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct FirmState {
@@ -11782,6 +12238,18 @@ pub struct RiskTierUpdated {
     pub changed_at: i64,
 }
 
+/// Emitted by `clear_velocity_break_permissionless`. The auto-clear inside `process_queued_payout`
+/// is already visible through `QueuedPayoutFilled`; this is the only release that happens with no
+/// payout attached, so it needs its own record — an indexer can otherwise see a firm's freeze end
+/// with nothing on-chain explaining why. `treasury_sol` is the vault balance the release was
+/// granted against, so the evidence is auditable after the fact.
+#[event]
+pub struct VelocityBreakCleared {
+    pub firm: Pubkey,
+    pub treasury_sol: u64,
+    pub cleared_at: i64,
+}
+
 #[event]
 pub struct PlatformOverrideUpdated {
     pub override_tier: u8,
@@ -12264,6 +12732,12 @@ pub struct LossBackMinStakeSet {
 }
 
 #[event]
+pub struct FirmProvisioningAuthoritySet {
+    pub firm: Pubkey,
+    pub provisioning_authority: Pubkey,
+}
+
+#[event]
 pub struct GuardianRotated {
     pub firm: Pubkey,
     pub new_guardian: Pubkey,
@@ -12293,6 +12767,13 @@ pub struct FirmaRouted {
     pub kept_in_wallet: u64,
 }
 
+/// A tranche of the Tier-2 reserve moved from its vest into the firm's payout vault.
+#[event]
+pub struct VestedReserveReleased {
+    pub firm: Pubkey,
+    pub amount: u64,
+}
+
 #[error_code]
 pub enum FirmError {
     #[msg("risk tier may only move one step per update")]
@@ -12315,7 +12796,13 @@ pub enum FirmError {
     TreasuryDesync,
     #[msg("challenge has not passed — no payout owed")]
     ChallengeNotPassed,
-    #[msg("daily payout cap (20% of treasury) exceeded")]
+    /// RETIRED by PAYOUT-CAP-REMOVE-1 (DEC-101) — no code path can return this any more.
+    /// **Deliberately NOT deleted.** Anchor assigns error codes by ordinal from 6000, so removing a
+    /// variant silently renumbers every variant BELOW it — every off-chain match on a firm error
+    /// code would shift by one, with no compile error on either side. The variant stays as a
+    /// permanent reservation of its ordinal. Keep new variants appended at the END for the same
+    /// reason. Old bytecode can still return it, so off-chain benign-revert matching keeps it too.
+    #[msg("RETIRED (DEC-101): the daily payout cap no longer exists")]
     DailyPayoutCapExceeded,
     #[msg("treasury has insufficient SOL for this payout")]
     InsufficientTreasury,
@@ -12526,11 +13013,45 @@ pub enum FirmError {
     PmStaleCurveSizeMismatch,
     #[msg("this pre-redesign curve holds non-zero real balance — closing it would destroy real value, refusing")]
     PmStaleCurveNotEmpty,
+    // Appended (bug-031 follow-up — permissionless velocity-break release).
+    #[msg("this firm's velocity-break flag is not set — there is nothing to clear")]
+    VelocityBreakNotActive,
+    #[msg("this firm still has outstanding queued payouts — solvency cannot be proven on-chain while it owes something, so the breaker stays set")]
+    VelocityBreakPayoutsOutstanding,
+    #[msg("this firm's treasury vault holds no more than insolvency dust — the breaker is doing its job, refusing to clear it")]
+    VelocityBreakTreasuryUnproven,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RESERVE-VEST-1 — the Streamflow `withdraw` discriminator is a magic constant taken from
+    /// another program's deployed IDL. If it is wrong the CPI does not fail cleanly: it dispatches to
+    /// whatever instruction those 8 bytes DO select, or to none, and it surfaces as an opaque revert
+    /// mid-payout. Anchor derives these as the first 8 bytes of `sha256("global:<name>")`, so the
+    /// constant is checkable with no network call — which matters, because a test that needs devnet
+    /// is a test nobody runs.
+    #[test]
+    fn streamflow_withdraw_discriminator_matches_anchors_derivation() {
+        use anchor_lang::solana_program::hash::hash;
+        let expected = &hash(b"global:withdraw").to_bytes()[..8];
+        assert_eq!(STREAMFLOW_WITHDRAW_DISCRIMINATOR, expected);
+    }
+
+    /// The two Streamflow deployments are different addresses. Shipping the devnet one to mainnet
+    /// would make every reserve release fail against an account that does not exist there.
+    #[test]
+    fn streamflow_program_id_is_cluster_correct() {
+        let devnet = pubkey!("HqDGZjaVRXJ9MGRQEw7qDc2rAr6iH1n1kAQdCZaCMfMZ");
+        let mainnet = pubkey!("strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m");
+        assert_ne!(devnet, mainnet);
+        #[cfg(feature = "streamflow-devnet")]
+        assert_eq!(STREAMFLOW_PROGRAM_ID, devnet);
+        #[cfg(not(feature = "streamflow-devnet"))]
+        assert_eq!(STREAMFLOW_PROGRAM_ID, mainnet);
+    }
+
 
     // ── DEC-77 first-payout instant advance (§22b) ────────────────────────────────────────────────
     // The advance-cap headroom math (`bps(treasury, ADVANCE_CAP_BPS) - advance_sol_outstanding`) is the
@@ -12641,20 +13162,30 @@ mod tests {
     }
 
     #[test]
-    fn advance_daily_cap_is_tighter_than_the_shared_payout_cap_but_looser_than_the_instant_cap() {
+    fn advance_daily_cap_is_looser_than_the_instant_cap_but_never_the_whole_treasury() {
         let treasury = 1_000_000_000_000u64; // 1,000 SOL
         let instant_cap = bps(treasury, ADVANCE_CAP_BPS); // 2%
         let advance_daily_cap = bps(treasury, ADVANCE_DAILY_CAP_BPS); // 6%
-        let shared_daily_cap = treasury / 5; // 20%, process_queued_payout + advance_first_payout combined
         assert!(advance_daily_cap > instant_cap); // allows more than one refill/day
-        assert!(advance_daily_cap < shared_daily_cap); // but still tighter than the general payout cap
         assert_eq!(advance_daily_cap, instant_cap * 3); // ~3 refill-cycles/day, not unbounded
+
+        // PAYOUT-CAP-REMOVE-1 (DEC-101): this used to also assert `advance_daily_cap < treasury / 5`,
+        // the shared payout cap it was tuned to sit under. That cap is gone, so the comparison has no
+        // referent — but the ADVANCE caps deliberately survive it, and that is the point worth
+        // pinning: advancing against a still-Provisional settlement is a strictly different risk from
+        // paying out a Final one (no clawback, and SETTLE-SOL-PRICE-1 means no fault proof can ever
+        // validate the struck amount). Removing the general payout cap must not loosen these.
+        assert_eq!(ADVANCE_CAP_BPS, 200);
+        assert_eq!(ADVANCE_DAILY_CAP_BPS, 600);
+        assert!(advance_daily_cap < treasury, "an advance can never take the whole treasury");
     }
 
     #[test]
     fn advance_daily_floor_is_smaller_than_the_general_payout_floor() {
         // Deliberately a smaller baseline than MIN_DAILY_PAYOUT_FLOOR_SOL — this is the riskier,
         // no-clawback path, so a thin-treasury firm should not get the same generous floor as normal payouts.
+        // DEC-101 retired the payout floor's gate (the cap it floored is gone); the constant is kept
+        // precisely so this relative-magnitude intent stays expressible and this test keeps its referent.
         assert!(MIN_DAILY_ADVANCE_FLOOR_SOL < MIN_DAILY_PAYOUT_FLOOR_SOL);
         assert_eq!(MIN_DAILY_ADVANCE_FLOOR_SOL, 500_000_000); // 0.5 SOL
     }
@@ -12992,18 +13523,84 @@ mod tests {
         assert_eq!(owner_bps_for_tier(4), 1400); // Enterprise 14% (was 15%; -1% to $DPROP staking)
     }
 
+    /// PAYOUT-CAP-REMOVE-1 (DEC-101) — pins the DEFECT that retired the daily payout cap, so nobody
+    /// reintroduces the same shape. This is deliberately a test of the OLD arithmetic: it is the
+    /// regression evidence, not a description of current behaviour.
     #[test]
-    fn daily_cap_floor_breaks_thin_treasury_spiral() {
-        // OMEGA #1: a thin treasury would be strangled by the flat 20% cap; the floor restores it.
-        // Units are now lamports (9 dp) post-migration; the floor magnitude is a Phase-6 tunable, so
-        // these are relative-magnitude assertions (floor binds when treasury/5 < floor) not USD ones.
-        let thin: u64 = 5_000_000_000;
-        assert_eq!(thin / 5, 1_000_000_000); // percentage cap below the floor
-        assert_eq!((thin / 5).max(MIN_DAILY_PAYOUT_FLOOR_SOL), MIN_DAILY_PAYOUT_FLOOR_SOL); // floor binds
-        assert!((thin / 5).max(MIN_DAILY_PAYOUT_FLOOR_SOL) > thin / 5);
-        // A deep treasury is unaffected — the percentage still governs above the floor.
-        let deep: u64 = 1_000_000_000_000;
-        assert_eq!((deep / 5).max(MIN_DAILY_PAYOUT_FLOOR_SOL), deep / 5);
+    fn retired_daily_cap_ratchet_shut_at_a_sixth_not_a_fifth() {
+        // The old gate was `daily_payout_spent + amount <= treasury_sol / 5`, with `treasury_sol`
+        // re-read on EVERY call — i.e. after the previous buy had already reduced it. Spending `x`
+        // out of an opening treasury `T` therefore left the next call testing `x <= (T - x) / 5`,
+        // which fails once `x > T/6`. The intended 20% ceiling was really 16.67%.
+        let opening: u64 = 900_000_000_000; // 900 SOL, Trustless Funding's typical morning balance
+        let intended = opening / 5; // 180 SOL — what the cap was documented to allow
+        let actual = opening / 6; // 150 SOL — what it actually allowed
+
+        // Spending the intended 20% ratchets the cap BELOW what was already spent.
+        let after_intended = opening - intended;
+        assert!(
+            after_intended / 5 < intended,
+            "the recomputed cap must fall below the spend — this is the ratchet"
+        );
+
+        // Spending exactly the true limit leaves the next call with essentially no room, which is
+        // the 0.2-0.9 SOL residual seen on every escalation day in the devnet record.
+        let after_actual = opening - actual;
+        assert_eq!(after_actual / 5, actual, "T/6 is the fixed point where the cap meets the spend");
+
+        // And that shortfall is what escalated a solvent firm to the Tier-2 reserve.
+        assert!(actual < intended);
+        assert_eq!(intended - actual, 30_000_000_000); // 30 SOL/day of Tier-1 buying lost, at T=900
+    }
+
+    /// PAYOUT-CAP-REMOVE-2 (bug-031) — the breaker's insolvency predicate. A partial fill alone must
+    /// never trip it; only a partial fill that also drained the treasury may.
+    #[test]
+    fn velocity_break_trips_only_on_a_drained_treasury() {
+        let trip = |fully_filled: bool, treasury_after: u64| {
+            !fully_filled && treasury_after <= INSOLVENCY_RESIDUAL_DUST_SOL
+        };
+
+        // The false positive that latched Trustless Funding: short fill, treasury untouched-healthy.
+        assert!(!trip(false, 355_840_000_000));
+        // A short fill against a genuinely drained treasury IS insolvency.
+        assert!(trip(false, 0));
+        // Drained-but-for-the-curve's-fee-rebate still counts — the reason this is a dust band and
+        // not `== 0` (an `== 0` predicate would never fire, leaving the breaker dead).
+        assert!(trip(false, 1_500_000));
+        assert!(trip(false, INSOLVENCY_RESIDUAL_DUST_SOL));
+        assert!(!trip(false, INSOLVENCY_RESIDUAL_DUST_SOL + 1));
+        // A FULL fill never trips, regardless of how little is left afterwards.
+        assert!(!trip(true, 0));
+    }
+
+    /// bug-031, third defect: the auto-clear in `process_queued_payout` only fires on a next full
+    /// fill, so a firm that trips the breaker and then goes quiet can never reach it. These pin the
+    /// permissionless release's gate — the predicate `clear_velocity_break_permissionless` enforces.
+    #[test]
+    fn permissionless_velocity_break_release_gate() {
+        let releasable = |flag_set: bool, open_payouts: u32, treasury_vault: u64| {
+            flag_set && open_payouts == 0 && treasury_vault > INSOLVENCY_RESIDUAL_DUST_SOL
+        };
+
+        // The firm this exists for: latched, owes nothing, holds 355.84 SOL. Releasable by anyone.
+        assert!(releasable(true, 0, 355_840_000_000));
+
+        // Nothing to clear — refuse rather than emit a no-op release event.
+        assert!(!releasable(false, 0, 355_840_000_000));
+
+        // Still owes something. The program stores only a COUNT of queued payouts, never their
+        // summed value, so it cannot prove the treasury covers them — a rich-looking treasury is not
+        // evidence of solvency while obligations are outstanding. Refuse at any balance.
+        assert!(!releasable(true, 1, 355_840_000_000));
+        assert!(!releasable(true, 7, u64::MAX));
+
+        // Genuinely drained: the breaker is doing exactly its job. Boundary is strict `>`, matching
+        // the trip condition's `<=` so the two predicates meet without a gap where a firm is neither
+        // trippable nor releasable.
+        assert!(!releasable(true, 0, 0));
+        assert!(!releasable(true, 0, INSOLVENCY_RESIDUAL_DUST_SOL));
+        assert!(releasable(true, 0, INSOLVENCY_RESIDUAL_DUST_SOL + 1));
     }
 
     #[test]
@@ -13132,12 +13729,16 @@ mod tests {
 
     #[test]
     fn migration_fee_split_skims_dp_and_dprop_burn() {
-        // Graduation at the default 107-SOL threshold (DEFAULT_BOOTSTRAP.graduationThreshold):
-        // 1.5% fee = 1.0% DP + 0.5% $DPROP burn; rest seeds the pool.
+        // A 107-SOL graduation. Kept as a round fixture, not as "the threshold" — the real one is
+        // solved per launch from a live SOL/USD price (MC-2) and `DEFAULT_BOOTSTRAP` has read 83
+        // since the 2026-07-11 curve retune; this comment claimed 107 was the default long after
+        // it stopped being one.
+        //
+        // 3.5% fee = 2.5% DP + 1.0% $DPROP burn (raised from 1.5% on 2026-08-20); rest seeds the pool.
         let s = compute_migration_fee_split(107_000_000_000);
-        assert_eq!(s.dp, 1_070_000_000); // 1.0%
-        assert_eq!(s.dprop_burn, 535_000_000); // 0.5%
-        assert_eq!(s.to_pool, 105_395_000_000); // remainder (98.5%) seeds Raydium
+        assert_eq!(s.dp, 2_675_000_000); // 2.5%
+        assert_eq!(s.dprop_burn, 1_070_000_000); // 1.0%
+        assert_eq!(s.to_pool, 103_255_000_000); // remainder (96.5%) seeds Raydium
         assert_eq!(s.dp + s.dprop_burn + s.to_pool, 107_000_000_000); // conserves
         // The two fee legs sum to the headline MIGRATION_FEE_BPS.
         assert_eq!(MIGRATION_FEE_DP_BPS + MIGRATION_FEE_DPROP_BURN_BPS, MIGRATION_FEE_BPS);

@@ -10,6 +10,11 @@ name = "firm"
 
 [features]
 default = []
+# Point `STREAMFLOW_PROGRAM_ID` at Streamflow's DEVNET deployment. Their program IDs differ per
+# cluster (unlike ours, which are identical everywhere), so this must be set for devnet builds and
+# must NOT be set for mainnet — a devnet address in a mainnet build would make every reserve release
+# fail on an address that does not exist there.
+streamflow-devnet = []
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
