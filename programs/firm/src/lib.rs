@@ -3211,6 +3211,314 @@ pub mod firm {
         Ok(())
     }
 
+    /// Put 80% of a firm's operator drip into a Streamflow vest (DRIPVEST-1). Permissionless,
+    /// one-shot per firm, and deliberately invisible to the operator.
+    ///
+    /// `RESERVE-VEST-1` fixed two thirds of the concentration problem it measured — "two protocol
+    /// addresses hold 30%" — by vesting `treasury_firma_vault`. This is the other address. Nothing
+    /// about the drip is mechanically wrong; `claim_drip` works and is untouched by this. What it
+    /// does not do is READ as vesting, which was the entire point of the exercise.
+    ///
+    /// ── Why the recipient is its OWN PDA and not the firm ──
+    /// The reserve vest already names the firm PDA as recipient, and Streamflow pays the recipient's
+    /// ATA. If this vest did the same, both would settle into ATA(firm, mint) — and
+    /// `sweep_reserve_ata` would move the operator's drip into `treasury_firma_vault`, quietly
+    /// converting operator money into payout capital with nothing to distinguish it. So the drip
+    /// vest gets `["drip_vest_recipient", firm]`, whose ATA is a different account, swept by
+    /// `sweep_drip_ata` back into `owner_drip_vault` where `claim_drip` looks.
+    pub fn create_owner_drip_vest(ctx: Context<CreateOwnerDripVest>) -> Result<()> {
+        require!(
+            ctx.accounts.stream_metadata.data_is_empty(),
+            FirmError::DripVestAlreadyExists
+        );
+        require_keys_eq!(
+            ctx.accounts.recipient_tokens.key(),
+            associated_token::get_associated_token_address(
+                &ctx.accounts.drip_vest_recipient.key(),
+                &ctx.accounts.firma_mint.key()
+            ),
+            FirmError::Unauthorized
+        );
+        require_keys_eq!(
+            ctx.accounts.streamflow_treasury_tokens.key(),
+            associated_token::get_associated_token_address(
+                &STREAMFLOW_TREASURY,
+                &ctx.accounts.firma_mint.key()
+            ),
+            FirmError::Unauthorized
+        );
+
+        let vault_amount = ctx.accounts.drip_vault.amount;
+        require!(vault_amount > 0, FirmError::ZeroAmount);
+        let gross = u64::try_from(
+            (vault_amount as u128)
+                .checked_mul(OWNER_DRIP_VEST_BPS as u128)
+                .ok_or(FirmError::MathOverflow)?
+                / 10_000u128,
+        )
+        .map_err(|_| FirmError::MathOverflow)?;
+        let per_period = gross / RESERVE_VEST_PERIODS;
+        require!(per_period > 0, FirmError::DripVestTooSmall);
+        let net = per_period
+            .checked_mul(RESERVE_VEST_PERIODS)
+            .ok_or(FirmError::MathOverflow)?;
+
+        let bump = [ctx.accounts.firm_state.bump];
+        let firm_seeds = firm_signer(&ctx.accounts.firm_state.owner, &bump);
+        let firm_key = ctx.accounts.firm_state.key();
+        let md_bump = [ctx.bumps.stream_metadata];
+        let md_seeds: &[&[u8]] = &[b"drip_vest", firm_key.as_ref(), &md_bump];
+
+        associated_token::create_idempotent(CpiContext::new(
+            ctx.accounts.associated_token_program.to_account_info(),
+            associated_token::Create {
+                payer: ctx.accounts.cranker.to_account_info(),
+                associated_token: ctx.accounts.streamflow_treasury_tokens.to_account_info(),
+                authority: ctx.accounts.streamflow_treasury.to_account_info(),
+                mint: ctx.accounts.firma_mint.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+        ))?;
+        // Streamflow only accepts an ATA as `sender_tokens`, and `owner_drip_vault` is a seeded PDA
+        // vault — the same constraint the reserve vest hit.
+        //
+        // **The drip stages through ITS OWN account, never ATA(firm, mint).** The reserve vest uses
+        // that one, and the first version of this instruction reused it — which meant the "sweep the
+        // leftover back" step at the end read the ATA's FULL balance and moved whatever the reserve
+        // had left sitting there into `owner_drip_vault`. On devnet that silently converted 159
+        // trillion raw of Tier-2 payout reserve into operator money. Sender and recipient are both
+        // `drip_vest_recipient` here (Streamflow accepts a self-stream — the reserve vest is one),
+        // so the drip touches exactly one token account and it is one nothing else settles into.
+        associated_token::create_idempotent(CpiContext::new(
+            ctx.accounts.associated_token_program.to_account_info(),
+            associated_token::Create {
+                payer: ctx.accounts.cranker.to_account_info(),
+                associated_token: ctx.accounts.recipient_tokens.to_account_info(),
+                authority: ctx.accounts.drip_vest_recipient.to_account_info(),
+                mint: ctx.accounts.firma_mint.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+        ))?;
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.drip_vault.to_account_info(),
+                    to: ctx.accounts.recipient_tokens.to_account_info(),
+                    authority: ctx.accounts.firm_state.to_account_info(),
+                },
+                &[&firm_seeds],
+            ),
+            gross,
+        )?;
+
+        let rent = Rent::get()?;
+        anchor_lang::system_program::create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.cranker.to_account_info(),
+                    to: ctx.accounts.stream_metadata.to_account_info(),
+                },
+                &[md_seeds],
+            ),
+            rent.minimum_balance(STREAM_METADATA_LEN),
+            STREAM_METADATA_LEN as u64,
+            &ctx.accounts.streamflow_program.key(),
+        )?;
+
+        let now = Clock::get()?.unix_timestamp as u64;
+        let mut stream_name = [0u8; 64];
+        let label = b"DecentralProp operator allocation";
+        stream_name[..label.len()].copy_from_slice(label);
+        let recipient_key = ctx.accounts.drip_vest_recipient.key();
+        let rcpt_bump = [ctx.bumps.drip_vest_recipient];
+        let rcpt_seeds: &[&[u8]] = &[b"drip_vest_recipient", firm_key.as_ref(), &rcpt_bump];
+
+        let mut data = Vec::with_capacity(200);
+        data.extend_from_slice(&STREAMFLOW_CREATE_UNCHECKED_WITH_PAYER_DISCRIMINATOR);
+        data.extend_from_slice(&now.saturating_add(1).to_le_bytes());
+        data.extend_from_slice(&net.to_le_bytes());
+        data.extend_from_slice(&RESERVE_VEST_PERIOD_SECS.to_le_bytes());
+        data.extend_from_slice(&per_period.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // cliff
+        data.extend_from_slice(&0u64.to_le_bytes()); // cliff_amount
+        data.push(0); // cancelable_by_sender — irrevocable
+        data.push(0); // cancelable_by_recipient
+        data.push(0); // automatic_withdrawal
+        data.push(0); // transferable_by_sender
+        data.push(0); // transferable_by_recipient
+        data.push(0); // can_topup
+        data.extend_from_slice(&stream_name);
+        data.extend_from_slice(&0u64.to_le_bytes()); // withdraw_frequency
+        data.extend_from_slice(recipient_key.as_ref()); // recipient — the drip-vest PDA, not the firm
+        data.extend_from_slice(recipient_key.as_ref()); // partner — ourselves
+        data.push(0); // pausable
+        data.push(0); // can_update_rate
+
+        let metas = vec![
+            AccountMeta::new(ctx.accounts.cranker.key(), true),
+            AccountMeta::new(recipient_key, true), // sender == recipient, both the drip-vest PDA
+            AccountMeta::new(ctx.accounts.recipient_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.stream_metadata.key(), false),
+            AccountMeta::new(ctx.accounts.escrow_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.withdrawor.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.firma_mint.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.fee_oracle.key(), false),
+            AccountMeta::new_readonly(anchor_lang::solana_program::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(ctx.accounts.streamflow_program.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+        ];
+        anchor_lang::solana_program::program::invoke_signed(
+            &anchor_lang::solana_program::instruction::Instruction {
+                program_id: ctx.accounts.streamflow_program.key(),
+                accounts: metas,
+                data,
+            },
+            &[
+                ctx.accounts.cranker.to_account_info(),
+                ctx.accounts.drip_vest_recipient.to_account_info(),
+                ctx.accounts.recipient_tokens.to_account_info(),
+                ctx.accounts.stream_metadata.to_account_info(),
+                ctx.accounts.escrow_tokens.to_account_info(),
+                ctx.accounts.withdrawor.to_account_info(),
+                ctx.accounts.firma_mint.to_account_info(),
+                ctx.accounts.fee_oracle.to_account_info(),
+                ctx.accounts.rent.to_account_info(),
+                ctx.accounts.streamflow_program.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[rcpt_seeds, md_seeds],
+        )?;
+
+        // Dust and any unused fee headroom go straight back to the drip vault — operator money never
+        // rests anywhere `claim_drip` cannot see it.
+        let leftover = {
+            let d = ctx.accounts.recipient_tokens.try_borrow_data()?;
+            if d.len() >= 72 { u64::from_le_bytes(d[64..72].try_into().unwrap()) } else { 0 }
+        };
+        if leftover > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.recipient_tokens.to_account_info(),
+                        to: ctx.accounts.drip_vault.to_account_info(),
+                        authority: ctx.accounts.drip_vest_recipient.to_account_info(),
+                    },
+                    &[rcpt_seeds],
+                ),
+                leftover,
+            )?;
+        }
+
+        emit!(OwnerDripVestCreated {
+            firm: firm_key,
+            stream: ctx.accounts.stream_metadata.key(),
+            net_amount: net,
+            amount_per_period: per_period,
+            period_secs: RESERVE_VEST_PERIOD_SECS,
+        });
+        Ok(())
+    }
+
+    /// Move the drip vest's staging ATA into `owner_drip_vault`. Permissionless, idempotent, no-op at
+    /// zero — the drip-side twin of `sweep_reserve_ata`, and it exists for the same reason:
+    /// Streamflow's withdrawor can withdraw without us, and it pays the recipient's ATA. Unswept,
+    /// that balance is operator money `claim_drip` cannot pay out.
+    pub fn sweep_drip_ata(ctx: Context<SweepDripAta>) -> Result<()> {
+        let amount = ctx.accounts.recipient_tokens.amount;
+        if amount == 0 {
+            return Ok(());
+        }
+        let bump = [ctx.bumps.drip_vest_recipient];
+        let firm_key = ctx.accounts.firm_state.key();
+        let seeds: &[&[u8]] = &[b"drip_vest_recipient", firm_key.as_ref(), &bump];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.recipient_tokens.to_account_info(),
+                    to: ctx.accounts.drip_vault.to_account_info(),
+                    authority: ctx.accounts.drip_vest_recipient.to_account_info(),
+                },
+                &[seeds],
+            ),
+            amount,
+        )?;
+        emit!(DripAtaSwept { firm: firm_key, amount });
+        Ok(())
+    }
+
+    /// Pull a vested tranche of the operator drip out of Streamflow and into `owner_drip_vault`,
+    /// where `claim_drip` pays it out on the operator's own 24-month schedule. Permissionless.
+    pub fn release_vested_drip(ctx: Context<ReleaseVestedDrip>, amount: u64) -> Result<()> {
+        require!(amount > 0, FirmError::ZeroAmount);
+        let firm_key = ctx.accounts.firm_state.key();
+        let bump = [ctx.bumps.drip_vest_recipient];
+        let seeds: &[&[u8]] = &[b"drip_vest_recipient", firm_key.as_ref(), &bump];
+
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&STREAMFLOW_WITHDRAW_DISCRIMINATOR);
+        data.extend_from_slice(&amount.to_le_bytes());
+        let recipient = ctx.accounts.drip_vest_recipient.key();
+        let metas = vec![
+            AccountMeta::new_readonly(recipient, true), // authority == recipient
+            AccountMeta::new(recipient, false),
+            AccountMeta::new(ctx.accounts.recipient_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.stream_metadata.key(), false),
+            AccountMeta::new(ctx.accounts.escrow_tokens.key(), false),
+            AccountMeta::new(ctx.accounts.streamflow_treasury.key(), false),
+            AccountMeta::new(ctx.accounts.streamflow_treasury_tokens.key(), false),
+            AccountMeta::new(recipient, false),                             // partner == recipient
+            AccountMeta::new(ctx.accounts.recipient_tokens.key(), false),   // partner_tokens
+            AccountMeta::new(ctx.accounts.firma_mint.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+        ];
+        anchor_lang::solana_program::program::invoke_signed(
+            &anchor_lang::solana_program::instruction::Instruction {
+                program_id: ctx.accounts.streamflow_program.key(),
+                accounts: metas,
+                data,
+            },
+            &[
+                ctx.accounts.drip_vest_recipient.to_account_info(),
+                ctx.accounts.recipient_tokens.to_account_info(),
+                ctx.accounts.stream_metadata.to_account_info(),
+                ctx.accounts.escrow_tokens.to_account_info(),
+                ctx.accounts.streamflow_treasury.to_account_info(),
+                ctx.accounts.streamflow_treasury_tokens.to_account_info(),
+                ctx.accounts.firma_mint.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.streamflow_program.to_account_info(),
+            ],
+            &[seeds],
+        )?;
+
+        ctx.accounts.recipient_tokens.reload()?;
+        let landed = ctx.accounts.recipient_tokens.amount;
+        if landed > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.recipient_tokens.to_account_info(),
+                        to: ctx.accounts.drip_vault.to_account_info(),
+                        authority: ctx.accounts.drip_vest_recipient.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                landed,
+            )?;
+        }
+        emit!(VestedDripReleased { firm: firm_key, amount: landed });
+        Ok(())
+    }
+
     /// Pull vested Tier-2 reserve out of its Streamflow vest and into the firm's payout vault
     /// (RESERVE-VEST-1). Permissionless.
     ///
@@ -5216,6 +5524,20 @@ pub const RESERVE_VEST_PERIOD_SECS: u64 = 60;
 #[cfg(not(feature = "streamflow-devnet"))]
 pub const RESERVE_VEST_PERIOD_SECS: u64 = 86_400;
 pub const RESERVE_VEST_PERIODS: u64 = 180;
+
+/// ── The operator drip vest (DRIPVEST-1) ──
+/// The other half of the whale problem `RESERVE-VEST-1` measured: `owner_drip_vault` holds 10% of
+/// every firm's supply, and on a holder tab an ordinary PDA holding 10% is indistinguishable from a
+/// founder wallet. Same remedy, same schedule — 80% of the drip vault streams through Streamflow so
+/// an indexer can recognise it, 20% stays liquid.
+///
+/// **Why 20% liquid is the safety property, not a rounding choice.** `claim_drip` pays
+/// `total_tokens / DRIP_MONTHS` per month out of this vault and reads the ORIGINAL total, not the
+/// live balance — so if the vault is short, an operator's scheduled claim fails outright. 20% liquid
+/// is **4.8 months of drip claims covered with the release keeper completely dead**, and the vest
+/// itself fully releases in 6 months against a 24-month drip, so the drip is always the binding
+/// schedule. The operator sees no change at all: same instruction, same cadence, same amount.
+pub const OWNER_DRIP_VEST_BPS: u16 = 8_000;
 
 pub const FIRMA_DECIMALS: u8 = 6;
 /// Highest deployment tier index (0 Starter … 4 Enterprise).
@@ -10636,6 +10958,165 @@ pub struct CreateReserveVest<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CreateOwnerDripVest<'info> {
+    /// Permissionless cranker — pays rent for the metadata and the ATAs, and chooses nothing else.
+    #[account(mut)]
+    pub cranker: Signer<'info>,
+
+    #[account(mut, seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(
+        mut,
+        token::mint = firm_state.firma_mint,
+        seeds = [b"owner_drip_vault", firm_state.key().as_ref()],
+        bump
+    )]
+    pub drip_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    /// CHECK: `["drip_vest_recipient", firm]` — the drip vest's own recipient, holding no data and
+    /// signing only via these seeds. It exists so the drip's withdrawals land in an ATA that is NOT
+    /// ATA(firm, mint): the reserve vest already owns that one, and `sweep_reserve_ata` would
+    /// otherwise move the operator's drip into the payout treasury.
+    #[account(mut, seeds = [b"drip_vest_recipient", firm_state.key().as_ref()], bump)]
+    pub drip_vest_recipient: UncheckedAccount<'info>,
+
+    /// CHECK: ATA(drip_vest_recipient, mint) — created here. This vest's ONLY token account: it is
+    /// both the Streamflow `sender_tokens` and the account withdrawals settle into. Deliberately not
+    /// ATA(firm, mint), which the reserve vest owns — see the handler for what sharing it cost.
+    #[account(mut)]
+    pub recipient_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: allocated here at `STREAM_METADATA_LEN`, owned by Streamflow, ours by seed.
+    #[account(mut, seeds = [b"drip_vest", firm_state.key().as_ref()], bump)]
+    pub stream_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's escrow, validated against their real recipe (`ESCROW-SEED-1`).
+    #[account(
+        mut,
+        seeds = [STREAMFLOW_ESCROW_SEED, stream_metadata.key().as_ref()],
+        bump,
+        seeds::program = STREAMFLOW_PROGRAM_ID,
+    )]
+    pub escrow_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: pinned.
+    #[account(mut, address = STREAMFLOW_WITHDRAWOR)]
+    pub withdrawor: UncheckedAccount<'info>,
+    /// CHECK: pinned — this account prices the stream's fee, so it is never caller-supplied.
+    #[account(address = STREAMFLOW_FEE_ORACLE)]
+    pub fee_oracle: UncheckedAccount<'info>,
+    /// CHECK: pinned.
+    #[account(mut, address = STREAMFLOW_TREASURY)]
+    pub streamflow_treasury: UncheckedAccount<'info>,
+    /// CHECK: ATA(streamflow_treasury, mint), created here so the first release cannot fail on it.
+    #[account(mut)]
+    pub streamflow_treasury_tokens: UncheckedAccount<'info>,
+    /// CHECK: the Streamflow program for this cluster.
+    #[account(address = STREAMFLOW_PROGRAM_ID)]
+    pub streamflow_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct SweepDripAta<'info> {
+    pub cranker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(
+        mut,
+        token::mint = firm_state.firma_mint,
+        seeds = [b"owner_drip_vault", firm_state.key().as_ref()],
+        bump
+    )]
+    pub drip_vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: `["drip_vest_recipient", firm]` — the drip vest's own recipient, holding no data and
+    /// signing only via these seeds. It exists so the drip's withdrawals land in an ATA that is NOT
+    /// ATA(firm, mint): the reserve vest already owns that one, and `sweep_reserve_ata` would
+    /// otherwise move the operator's drip into the payout treasury.
+    #[account(mut, seeds = [b"drip_vest_recipient", firm_state.key().as_ref()], bump)]
+    pub drip_vest_recipient: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = firma_mint,
+        associated_token::authority = drip_vest_recipient,
+    )]
+    pub recipient_tokens: Box<Account<'info, TokenAccount>>,
+
+    #[account(address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseVestedDrip<'info> {
+    pub cranker: Signer<'info>,
+
+    #[account(seeds = [b"firm", firm_state.owner.as_ref()], bump = firm_state.bump)]
+    pub firm_state: Box<Account<'info, FirmState>>,
+
+    #[account(
+        mut,
+        token::mint = firm_state.firma_mint,
+        seeds = [b"owner_drip_vault", firm_state.key().as_ref()],
+        bump
+    )]
+    pub drip_vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: `["drip_vest_recipient", firm]` — the drip vest's own recipient, holding no data and
+    /// signing only via these seeds. It exists so the drip's withdrawals land in an ATA that is NOT
+    /// ATA(firm, mint): the reserve vest already owns that one, and `sweep_reserve_ata` would
+    /// otherwise move the operator's drip into the payout treasury.
+    #[account(mut, seeds = [b"drip_vest_recipient", firm_state.key().as_ref()], bump)]
+    pub drip_vest_recipient: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = firma_mint,
+        associated_token::authority = drip_vest_recipient,
+    )]
+    pub recipient_tokens: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut, address = firm_state.firma_mint)]
+    pub firma_mint: Box<Account<'info, Mint>>,
+
+    /// CHECK: validated by Streamflow against this recipient.
+    #[account(mut, seeds = [b"drip_vest", firm_state.key().as_ref()], bump)]
+    pub stream_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Streamflow's escrow for this stream.
+    #[account(
+        mut,
+        seeds = [STREAMFLOW_ESCROW_SEED, stream_metadata.key().as_ref()],
+        bump,
+        seeds::program = STREAMFLOW_PROGRAM_ID,
+    )]
+    pub escrow_tokens: UncheckedAccount<'info>,
+
+    /// CHECK: pinned.
+    #[account(mut, address = STREAMFLOW_TREASURY)]
+    pub streamflow_treasury: UncheckedAccount<'info>,
+    /// CHECK: their fee ATA.
+    #[account(mut)]
+    pub streamflow_treasury_tokens: UncheckedAccount<'info>,
+    /// CHECK: the Streamflow program for this cluster.
+    #[account(address = STREAMFLOW_PROGRAM_ID)]
+    pub streamflow_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 pub struct SweepReserveAta<'info> {
     /// Permissionless cranker — pays gas only. The tokens can move nowhere but the firm's own vault.
     pub cranker: Signer<'info>,
@@ -13250,6 +13731,27 @@ pub struct FirmaRouted {
 
 /// A tranche of the Tier-2 reserve moved from its vest into the firm's payout vault.
 #[event]
+pub struct OwnerDripVestCreated {
+    pub firm: Pubkey,
+    pub stream: Pubkey,
+    pub net_amount: u64,
+    pub amount_per_period: u64,
+    pub period_secs: u64,
+}
+
+#[event]
+pub struct DripAtaSwept {
+    pub firm: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct VestedDripReleased {
+    pub firm: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
 pub struct ReserveAtaSwept {
     pub firm: Pubkey,
     pub amount: u64,
@@ -13522,6 +14024,11 @@ pub enum FirmError {
     ReserveVestAlreadyExists,
     #[msg("this firm's reserve is too small to vest — one period's tranche would round to zero")]
     ReserveVestTooSmall,
+    // Appended (DRIPVEST-1). Never insert above this line.
+    #[msg("this firm already has an operator drip vest — the stream metadata PDA exists")]
+    DripVestAlreadyExists,
+    #[msg("this firm's operator drip is too small to vest — one period's tranche would round to zero")]
+    DripVestTooSmall,
 }
 
 #[cfg(test)]
@@ -13633,6 +14140,88 @@ mod tests {
         // and the fee ATA belongs to Streamflow's treasury, never to us
         let fee_ata = associated_token::get_associated_token_address(&STREAMFLOW_TREASURY, &mint);
         assert_ne!(fee_ata, sender);
+    }
+
+    #[test]
+    fn drip_vest_never_starves_a_scheduled_operator_claim() {
+        // The property this whole design rests on. `claim_drip` pays `total / DRIP_MONTHS` a month
+        // out of `owner_drip_vault` and reads the ORIGINAL total, not the live balance — so if the
+        // vault is short when a month comes due, the operator's claim fails outright. Vesting 80%
+        // of it is only safe because the drip is the slower schedule.
+        let total: u64 = 100_000_000_000_000; // 100M tokens at 6dp
+        let gross = total * OWNER_DRIP_VEST_BPS as u64 / 10_000;
+        // What actually leaves the vault is `per_period * PERIODS`, NOT `gross` — the handler streams
+        // whole tranches and sweeps the remainder straight back to `drip_vault`. Modelling that dust
+        // as lost is what made the first version of this test fail at month 24 by 64 raw units; the
+        // model was wrong, not the code, and the sweep is why.
+        let per_period = gross / RESERVE_VEST_PERIODS;
+        let vested = per_period * RESERVE_VEST_PERIODS;
+        assert!(vested <= gross, "cannot stream more than 80% of the vault");
+        let liquid = total - vested; // includes the swept-back dust
+        let per_month = drip_month_amount(total);
+
+        // Worst case first: the release keeper NEVER runs, so only the liquid share is ever
+        // available. It must still cover several months of claims.
+        let months_covered_with_no_keeper = liquid / per_month;
+        assert!(
+            months_covered_with_no_keeper >= 4,
+            "liquid share covers only {months_covered_with_no_keeper} months with a dead keeper"
+        );
+
+        // And with the keeper running, availability must beat the claim schedule at every month of
+        // the vest. Vest releases per completed period over RESERVE_VEST_PERIODS days; drip claims
+        // accrue monthly. Checked across the whole vesting window, not just the ends.
+        let vest_days = RESERVE_VEST_PERIODS; // one tranche per period
+        for month in 1..=DRIP_MONTHS as u64 {
+            let day = month * 30;
+            let periods_elapsed = if day >= vest_days { vest_days } else { day };
+            let released = per_period * periods_elapsed;
+            let available = liquid + released;
+            let owed = per_month * month;
+            assert!(
+                available >= owed,
+                "month {month}: available {available} < owed {owed}"
+            );
+        }
+
+        // Conservation: every token of the drip is still claimable once the vest has fully released.
+        assert_eq!(liquid + vested, total, "the vest must not consume any of the drip");
+        assert!(
+            drip_month_amount(total) * DRIP_MONTHS as u64 <= liquid + vested,
+            "the full 24-month drip must remain payable"
+        );
+    }
+
+    #[test]
+    fn drip_vest_recipient_is_not_the_firm_so_the_two_sweeps_cannot_collide() {
+        // Both vests pay their RECIPIENT'S ATA. If the drip vest reused the firm PDA as recipient,
+        // both would settle into ATA(firm, mint) and `sweep_reserve_ata` would move operator money
+        // into `treasury_firma_vault` — converting the operator's allocation into payout capital
+        // with nothing on chain to tell them apart. Pin that the two recipients differ.
+        let firm: Pubkey = "GhfjqaR9oJEWGgjRycoxnDp8419RStNWG5CDToYuofYa".parse().unwrap();
+        let (drip_recipient, _) =
+            Pubkey::find_program_address(&[b"drip_vest_recipient", firm.as_ref()], &crate::ID);
+        assert_ne!(drip_recipient, firm, "drip vest must not reuse the firm as recipient");
+
+        let mint: Pubkey = "AsuVaeQpV7hsPAzQNZDxt1r2fiBPBSfEa2rehDwv3Xfq".parse().unwrap();
+        let reserve_ata = associated_token::get_associated_token_address(&firm, &mint);
+        let drip_ata = associated_token::get_associated_token_address(&drip_recipient, &mint);
+        assert_ne!(reserve_ata, drip_ata, "the two vests must not share a settlement ATA");
+
+        // And the two streams must be distinct accounts too.
+        let (reserve_md, _) = Pubkey::find_program_address(&[b"reserve_vest", firm.as_ref()], &crate::ID);
+        let (drip_md, _) = Pubkey::find_program_address(&[b"drip_vest", firm.as_ref()], &crate::ID);
+        assert_ne!(reserve_md, drip_md);
+
+        // The drip must not touch ATA(firm, mint) AT ALL — not as a settlement account and not as a
+        // staging hop. The first build used it for staging, and because the "sweep the leftover back"
+        // step reads that account's FULL balance, it moved 159 trillion raw of Tier-2 payout reserve
+        // that the reserve vest had left sitting there into `owner_drip_vault`. Observed on devnet.
+        // Sender and recipient are now both the drip PDA, so the drip has exactly one token account.
+        assert_ne!(
+            drip_ata, reserve_ata,
+            "the drip vest must stage and settle in its own account, never the firm's"
+        );
     }
 
     #[test]
