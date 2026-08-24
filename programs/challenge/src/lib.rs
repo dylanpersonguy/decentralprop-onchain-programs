@@ -767,8 +767,30 @@ pub mod challenge {
         } else {
             settlement::genesis_state(&rules)
         };
-        // Fault iff the committed genesis differs from the honest one just derived.
-        require!(claimed_genesis != honest_genesis, ChallengeError::FaultNotProven);
+        // PAYOUT-REBASELINE-DAILY-1: a settlement whose preceding withdrawal cycle was proposed before
+        // that fix rebaselined under v1, so the v1 derivation is ALSO honest for it. Without this, every
+        // such settlement is permissionlessly faultable by anyone — the same grandfather clause, and the
+        // same reasoning, as `verify_withdrawal_genesis_fault`. Only reachable on the withdrawal branch;
+        // a cycle-0 settlement has no rebaseline and is unaffected.
+        let honest_genesis_v1 = if let Some(counter) = ctx.accounts.withdrawal_counter.as_ref() {
+            if counter.cycle > 0 {
+                prev_final_state.as_ref().zip(ctx.accounts.last_final_withdrawal.as_ref()).map(
+                    |(revealed, prev)| {
+                        settlement::rebaseline_after_withdrawal_v1(revealed, prev.gross_micro as i128)
+                    },
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Fault iff the committed genesis differs from every honest derivation.
+        require!(
+            claimed_genesis != honest_genesis
+                && honest_genesis_v1.map_or(true, |v1| claimed_genesis != v1),
+            ChallengeError::FaultNotProven
+        );
 
         fault_out(challenge, now, challenger);
         emit!(SettlementFaulted { challenge: challenge.key(), kind: FaultKind::Genesis as u8, index: 0, challenger });

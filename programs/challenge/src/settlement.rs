@@ -574,15 +574,52 @@ pub fn rebaseline_after_withdrawal(prev_final: &EngineState, gross_micro: i128) 
     let equity = prev_final.equity.saturating_sub(gross_micro);
     EngineState {
         equity,
-        // Collapse the high-water mark and the daily reference onto the new equity — a withdrawal is not
-        // a drawdown, and the trader gets a fresh daily-loss allowance from the rebaselined balance.
+        // Collapse the high-water mark onto the new equity — a withdrawal is not a drawdown.
         peak_equity: equity,
-        day_start_equity: equity,
+        // PAYOUT-REBASELINE-DAILY-1. DEBIT the daily reference by the same gross rather than collapsing
+        // it onto equity, so a withdrawal is NEUTRAL for the daily-loss rule instead of resetting it.
+        //
+        // v1 wrote `day_start_equity: equity`, described as handing the trader "a fresh daily-loss
+        // allowance from the rebaselined balance." At a day boundary that is what it does, because
+        // `apply_step`'s rollover overwrites `day_start_equity` on the cycle's first trade anyway. MID-day
+        // it does the opposite. The trader's gains already banked against that day are thrown away, and
+        // the same UTC day continues with a full-size limit measured from a baseline lower by the whole
+        // withdrawn gross — so ordinary intraday movement trips a limit they were never near.
+        //
+        // Observed in production: Trustless Funding account `71795c32`, 2026-08-20. The trader finished
+        // the day **up $1,262**; the rebaselined replay put them $70 over a $1,250 daily limit and set
+        // BREACH_DAILY_LOSS, which `propose_funded_withdrawal` below then refuses forever
+        // (`WithdrawalBreached`). $2,068.99 unpayable, with nothing off-chain agreeing anything was wrong.
+        //
+        // This preserves `day_start - equity` exactly across the debit, so it launders nothing: the day's
+        // running loss is carried, not forgiven, and `breach` stays sticky as before.
+        day_start_equity: prev_final.day_start_equity.saturating_sub(gross_micro),
         // Carried, NOT reset: a withdrawal is not a new evaluation.
         day_index: prev_final.day_index,
         trading_days: prev_final.trading_days,
         // STICKY. A withdrawal must never launder a breach — otherwise a breached funded account could
         // withdraw once and come back clean.
+        breach: prev_final.breach,
+    }
+}
+
+/// The PRE-`PAYOUT-REBASELINE-DAILY-1` rebaseline. Kept for one reason: cycles committed before that fix
+/// have their v1 genesis welded into `transcript_root` on-chain, and a fault verifier that only knows v2
+/// would report a genesis fault on every one of them. That is not a drift warning, it is a live
+/// false-slash path against honest history, permissionlessly callable by anyone.
+///
+/// **Only the fault verifiers may accept this.** `propose_funded_withdrawal` binds v2 and nothing else, so
+/// no NEW cycle can ever be committed under v1 — which is what makes accepting it here safe rather than a
+/// standing choice for an operator to exploit. The permissive branch can only ever excuse pre-upgrade
+/// history, which is exactly its job.
+pub fn rebaseline_after_withdrawal_v1(prev_final: &EngineState, gross_micro: i128) -> EngineState {
+    let equity = prev_final.equity.saturating_sub(gross_micro);
+    EngineState {
+        equity,
+        peak_equity: equity,
+        day_start_equity: equity,
+        day_index: prev_final.day_index,
+        trading_days: prev_final.trading_days,
         breach: prev_final.breach,
     }
 }
@@ -643,8 +680,17 @@ pub fn verify_withdrawal_genesis_fault(
     if recompute_root(&gh, genesis_proof) != *transcript_root {
         return false;
     }
-    // (c) fault iff it isn't the deterministic rebaseline of the committed predecessor.
+    // (c) fault iff it is neither accepted rebaseline of the committed predecessor.
+    //
+    // PAYOUT-REBASELINE-DAILY-1: v1 is accepted here and ONLY here. Cycles proposed before that fix
+    // committed a v1 genesis into `transcript_root`; checking v2 alone would make every one of them
+    // provably "faulty" to any passing challenger, voiding honest withdrawals and slashing the operator's
+    // bond on history that was correct under the rule in force when it was written.
+    //
+    // Safe because `propose_funded_withdrawal` binds v2 exclusively: the operator has no choice at commit
+    // time, so this cannot become a menu. It is a grandfather clause, not a relaxation.
     *claimed_genesis != rebaseline_after_withdrawal(prev_final_state, prev_gross_micro)
+        && *claimed_genesis != rebaseline_after_withdrawal_v1(prev_final_state, prev_gross_micro)
 }
 
 /// WITHDRAWAL-AMOUNT fault (DEC-62). Returns `true` iff the operator claimed more than the account has
@@ -1090,25 +1136,105 @@ mod tests {
     }
 
     #[test]
-    fn rebaseline_collapses_peak_and_daily_reference() {
+    fn rebaseline_collapses_peak_and_debits_the_daily_reference() {
         let r = rules();
-        // Trade up to $109k equity over 3 days, peak $109k.
+        // Trade up to $109k equity over 3 days, peak $109k. The last day opened at $106k, so the trader
+        // is +$3k on the day when they withdraw.
         let steps = [win(0, 3_000), win(SECONDS_PER_DAY, 3_000), win(2 * SECONDS_PER_DAY, 3_000)];
         let states = run_transcript(&r, &steps);
         let final_state = *states.last().unwrap();
         assert_eq!(final_state.equity, 109_000_000_000);
         assert_eq!(final_state.peak_equity, 109_000_000_000);
+        assert_eq!(final_state.day_start_equity, 106_000_000_000);
 
         // Withdraw the whole $9k gross → equity back to the $100k starting balance.
         let g = rebaseline_after_withdrawal(&final_state, 9_000_000_000);
         assert_eq!(g.equity, 100_000_000_000);
-        // The high-water mark and the daily reference COLLAPSE onto the new equity — a withdrawal is
-        // not a drawdown (mirrors applyPayoutDebit:156-162).
+        // The high-water mark COLLAPSES onto the new equity — a withdrawal is not a drawdown.
         assert_eq!(g.peak_equity, 100_000_000_000);
-        assert_eq!(g.day_start_equity, 100_000_000_000);
+        // PAYOUT-REBASELINE-DAILY-1: the daily reference is DEBITED, not collapsed. The trader was
+        // +$3k on the day before the withdrawal and is still +$3k after it, so the day's remaining
+        // loss allowance is unchanged rather than silently reset to zero.
+        assert_eq!(g.day_start_equity, 97_000_000_000);
+        assert_eq!(g.equity - g.day_start_equity, final_state.equity - final_state.day_start_equity);
         // Carried, not reset.
         assert_eq!(g.trading_days, 3);
         assert_eq!(g.day_index, final_state.day_index);
+
+        // v1 is the pre-fix rule, kept ONLY so the fault verifiers can grandfather history.
+        let v1 = rebaseline_after_withdrawal_v1(&final_state, 9_000_000_000);
+        assert_eq!(v1.day_start_equity, 100_000_000_000);
+        assert_ne!(v1.day_start_equity, g.day_start_equity);
+    }
+
+    #[test]
+    fn mid_day_withdrawal_no_longer_manufactures_a_daily_breach() {
+        // PAYOUT-REBASELINE-DAILY-1, reproduced from production: Trustless Funding account `71795c32`,
+        // 2026-08-20, payout `3cf73be7`. The trader withdrew just after the day's peak and then gave
+        // some of it back, finishing the day UP. Under v1 the replay set BREACH_DAILY_LOSS and
+        // `propose_funded_withdrawal` refused the next cycle forever (`WithdrawalBreached`).
+        //
+        // Scaled to this fixture's rules ($100k start, 5% daily = $5,000, 10% total DD = $10,000):
+        // day 1 opens at $103k, the trader makes $9k (equity $112k), withdraws the $9k gross mid-day,
+        // then loses $6k later the same day. They finish the day +$3k up, so nothing may breach. The
+        // $6k is chosen to sit above v1's $5k daily line and below both v2's ($14k) and the total
+        // drawdown's ($13k), which is what isolates the daily rule as the thing under test.
+        let r = rules();
+        let c0 = run_transcript(&r, &[win(0, 3_000), win(SECONDS_PER_DAY, 9_000)]);
+        let c0_final = *c0.last().unwrap();
+        assert_eq!(c0_final.equity, 112_000_000_000);
+        assert_eq!(c0_final.day_start_equity, 103_000_000_000); // day 1 opened here
+        assert_eq!(c0_final.breach, 0);
+
+        // Withdraw the $9k banked today, then lose $4k LATER THE SAME DAY (no rollover).
+        let g = rebaseline_after_withdrawal(&c0_final, 9_000_000_000);
+        let after = apply_step(&g, &loss(SECONDS_PER_DAY + 60, 6_000), &r);
+        assert_eq!(
+            after.breach, 0,
+            "a day the trader finished up must not breach after a mid-day withdrawal"
+        );
+
+        // The same sequence under v1 breaches — this is the bug, pinned so it cannot come back.
+        let g_v1 = rebaseline_after_withdrawal_v1(&c0_final, 9_000_000_000);
+        let after_v1 = apply_step(&g_v1, &loss(SECONDS_PER_DAY + 60, 6_000), &r);
+        assert_eq!(after_v1.breach, BREACH_DAILY_LOSS, "v1 is expected to be wrong here");
+    }
+
+    #[test]
+    fn fault_verifier_grandfathers_a_v1_genesis_but_still_catches_a_lie() {
+        // PAYOUT-REBASELINE-DAILY-1: cycles committed before the fix hold a v1 genesis in their
+        // transcript root. The verifier must not fault them — that would be a permissionless
+        // false-slash against honest history — while still faulting anything that is neither rule.
+        let r = rules();
+        let c0_final =
+            *run_transcript(&r, &[win(0, 3_000), win(SECONDS_PER_DAY, 3_000)]).last().unwrap();
+        let gross = 6_000_000_000;
+        let prev_hash = state_hash(&c0_final);
+
+        for genesis in [
+            rebaseline_after_withdrawal(&c0_final, gross),
+            rebaseline_after_withdrawal_v1(&c0_final, gross),
+        ] {
+            let cycle = run_transcript_from(&genesis, &r, &[win(2 * SECONDS_PER_DAY, 500)]);
+            let (root, proofs) = commit_states(&cycle);
+            assert!(
+                !verify_withdrawal_genesis_fault(
+                    &root, &cycle[0], &proofs[0], &c0_final, &prev_hash, gross
+                ),
+                "an honest genesis under either rule must not be faultable"
+            );
+        }
+
+        // A genesis that debited nothing is still a fault under both.
+        let cheat = rebaseline_after_withdrawal(&c0_final, 0);
+        let cheat_cycle = run_transcript_from(&cheat, &r, &[win(2 * SECONDS_PER_DAY, 500)]);
+        let (cheat_root, cheat_proofs) = commit_states(&cheat_cycle);
+        assert!(
+            verify_withdrawal_genesis_fault(
+                &cheat_root, &cheat_cycle[0], &cheat_proofs[0], &c0_final, &prev_hash, gross
+            ),
+            "an undebited genesis must still fault"
+        );
     }
 
     #[test]
@@ -1340,14 +1466,23 @@ mod tests {
         let g = rebaseline_after_withdrawal(&c0_final, 9_000_000_000);
         assert_eq!(g.equity, 100_000_000_000);
         assert_eq!(g.peak_equity, 100_000_000_000);
-        assert_eq!(g.day_start_equity, 100_000_000_000);
+        // PAYOUT-REBASELINE-DAILY-1 repinned this from 100_000_000_000 (v1 collapsed it onto equity).
+        assert_eq!(g.day_start_equity, 97_000_000_000);
         assert_eq!(g.day_index, 2);
         assert_eq!(g.trading_days, 3);
         assert_eq!(g.breach, 0);
         assert_eq!(
             state_hash(&g),
-            "bd487c7478ec0244237e2b26182e088a74e51e2b1a2ed1f0ffb86462d867df0a",
+            "2cf0989b137d369b858d8223e6745bed9636a0521edeffacf16d5c5c54d63927",
             "DEC-62 rebaselined-genesis state hash drifted"
+        );
+        // The pre-fix vector, kept so the grandfather path is pinned too rather than merely described.
+        let v1 = rebaseline_after_withdrawal_v1(&c0_final, 9_000_000_000);
+        assert_eq!(v1.day_start_equity, 100_000_000_000);
+        assert_eq!(
+            state_hash(&v1),
+            "bd487c7478ec0244237e2b26182e088a74e51e2b1a2ed1f0ffb86462d867df0a",
+            "the v1 vector is history and must never change"
         );
     }
 }
