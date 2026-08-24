@@ -276,6 +276,18 @@ pub mod challenge {
     ) -> Result<()> {
         let challenge = &mut ctx.accounts.challenge;
         require!(challenge.status == ChallengeStatus::Active, ChallengeError::NotActive);
+        // SETTLE-CHALLENGE-EARLY-FINAL-1. `propose_settlement` leaves `status == Active` (only
+        // `finalize_settlement` moves it), so without this guard the deprecated trusted path could be
+        // called on a challenge ALREADY inside its fraud-proof window. That writes
+        // `settlement_status = Final` while `settlement_window_end` keeps the nonzero value propose
+        // set — so M-1's payout gate (`Final && settlement_window_end > 0`) accepts it, the window is
+        // skipped, and every `prove_*_fault` becomes permanently unreachable (they all require
+        // `Provisional`). M-1's "can never release funds" claim only ever held for a NEVER-proposed
+        // challenge. Restrict this path to exactly that case.
+        require!(
+            challenge.settlement_status == SettlementStatus::Unsettled,
+            ChallengeError::SettlementAlreadyProposed
+        );
         // Only a FUNDED challenge can owe a payout. *Passing* an evaluation phase (Phase1/Phase2)
         // is an *advance* — the off-chain engine spawns the next-phase challenge; no funds move.
         // Only the funded account earns a withdrawal (mirrors the off-chain phase chain). A failed
